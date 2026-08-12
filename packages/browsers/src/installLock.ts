@@ -6,23 +6,29 @@
 
 import type {Stats} from 'node:fs';
 import {mkdir, readFile, rm, stat, writeFile} from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import {setTimeout as sleep} from 'node:timers/promises';
 
 import type {Browser, BrowserPlatform} from './browser-data/browser-data.js';
 import type {Cache} from './Cache.js';
-import {debug} from './debug.js';
+import {debug, type LoggerFunction} from './debug.js';
 
 const debugInstall = debug('puppeteer:browsers:install');
 
 const DEFAULT_INSTALL_LOCK_RETRY_DELAY = 100;
 const DEFAULT_INSTALL_LOCK_STALE_THRESHOLD = 5 * 60 * 1000;
 const DEFAULT_INSTALL_LOCK_HEARTBEAT_INTERVAL = 10 * 1000;
+const DEFAULT_INSTALL_LOCK_CLEANUP_MAX_RETRIES = 5;
+const DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY = 100;
 
 interface InstallLockOptions {
   retryDelay?: number;
   staleThreshold?: number;
   heartbeatInterval?: number;
+  cleanupMaxRetries?: number;
+  cleanupRetryDelay?: number;
+  logger?: LoggerFunction;
   /**
    * @internal
    */
@@ -35,17 +41,46 @@ interface InstallLockIdentity {
   birthtimeNs: bigint;
 }
 
+interface InstallLockOwner {
+  hostname: string;
+  pid: number;
+}
+
 type InstallLockSnapshot =
   | {
       fromHeartbeat: true;
       mtimeMs: number;
-      ownerPid?: number;
+      owner: InstallLockOwner | undefined;
     }
   | {
       fromHeartbeat: false;
       mtimeMs: number;
       lockIdentity: InstallLockIdentity;
     };
+
+type InstallLockBlockReason =
+  | 'invalid-owner-metadata'
+  | 'owner-alive'
+  | 'owner-unverifiable'
+  | 'unreliable-lock-identity'
+  | 'unstable-lock-identity';
+
+interface InstallLockBlockedResult {
+  status: 'blocked';
+  reason: InstallLockBlockReason;
+  snapshot: InstallLockSnapshot;
+}
+
+type InstallLockClaimability =
+  {status: 'claimable'} | {status: 'retry'} | InstallLockBlockedResult;
+
+type InstallLockClaimResult =
+  {status: 'claimed'} | {status: 'retry'} | InstallLockBlockedResult;
+
+interface InstallLockCleanupOptions {
+  maxRetries: number;
+  retryDelay: number;
+}
 
 export function installLockPath(
   cache: Cache,
@@ -67,6 +102,47 @@ function isErrorWithCode(error: unknown, code: string): boolean {
     'code' in error &&
     error.code === code
   );
+}
+
+function parseInstallLockOwner(value: string): InstallLockOwner | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return;
+  }
+  const owner = parsed as Record<string, unknown>;
+  const hostname = owner['hostname'];
+  const pid = owner['pid'];
+  if (
+    typeof hostname !== 'string' ||
+    hostname.length === 0 ||
+    hostname.trim() !== hostname ||
+    typeof pid !== 'number' ||
+    !Number.isSafeInteger(pid) ||
+    pid <= 0
+  ) {
+    return;
+  }
+  return {
+    hostname,
+    pid,
+  };
+}
+
+async function removeInstallLockPath(
+  targetPath: string,
+  options: InstallLockCleanupOptions,
+): Promise<void> {
+  await rm(targetPath, {
+    recursive: true,
+    force: true,
+    maxRetries: options.maxRetries,
+    retryDelay: options.retryDelay,
+  });
 }
 
 async function installLockIdentity(
@@ -91,9 +167,6 @@ async function statHeartbeat(lockPath: string): Promise<Stats | undefined> {
   }
 }
 
-/**
- * Returns undefined when a fresh heartbeat rules out this claim attempt.
- */
 async function inspectInstallLock(
   lockPath: string,
   staleThreshold: number,
@@ -105,17 +178,15 @@ async function inspectInstallLock(
       return;
     }
     try {
-      const ownerPidText = await readFile(heartbeatPath, 'utf8');
+      const ownerText = await readFile(heartbeatPath, 'utf8');
       const recheckedHeartbeatStats = await stat(heartbeatPath);
       if (Date.now() - recheckedHeartbeatStats.mtimeMs <= staleThreshold) {
         return;
       }
-      const ownerPid = Number(ownerPidText.trim());
       return {
         fromHeartbeat: true,
         mtimeMs: recheckedHeartbeatStats.mtimeMs,
-        ownerPid:
-          Number.isSafeInteger(ownerPid) && ownerPid > 0 ? ownerPid : undefined,
+        owner: parseInstallLockOwner(ownerText),
       };
     } catch (error) {
       if (!isErrorWithCode(error, 'ENOENT')) {
@@ -135,109 +206,240 @@ async function inspectInstallLock(
   };
 }
 
-function isSameInstallLock(
-  before: InstallLockIdentity,
-  after: InstallLockIdentity,
+/**
+ * @internal
+ */
+export function hasUsableInstallLockBirthtime(
+  identity: InstallLockIdentity,
 ): boolean {
-  return (
-    before.dev === after.dev &&
-    before.ino === after.ino &&
-    before.birthtimeNs === after.birthtimeNs
-  );
+  // Some filesystems report zero when birth time is unavailable. libuv may also
+  // synthesize it from ctime, making revalidation depend on filesystem timestamp
+  // resolution.
+  return identity.birthtimeNs > 0n;
 }
 
-function canClaimInstallLock(
-  snapshot: {mtimeMs: number; ownerPid?: number},
-  staleThreshold: number,
-): boolean {
-  if (Date.now() - snapshot.mtimeMs <= staleThreshold) {
-    return false;
+/**
+ * @internal
+ */
+export function compareInstallLockIdentity(
+  before: InstallLockIdentity,
+  after: InstallLockIdentity,
+): 'same' | 'recreated' | 'unstable' {
+  if (before.dev !== after.dev || before.ino !== after.ino) {
+    return 'recreated';
   }
-  if (snapshot.ownerPid === undefined) {
-    return true;
+  if (before.birthtimeNs !== after.birthtimeNs) {
+    return 'unstable';
+  }
+  return 'same';
+}
+
+function installLockClaimability(
+  snapshot: InstallLockSnapshot,
+  staleThreshold: number,
+  localHostname: string,
+): InstallLockClaimability {
+  if (Date.now() - snapshot.mtimeMs <= staleThreshold) {
+    return {status: 'retry'};
+  }
+  if (!snapshot.fromHeartbeat) {
+    if (!hasUsableInstallLockBirthtime(snapshot.lockIdentity)) {
+      return {
+        status: 'blocked',
+        reason: 'unreliable-lock-identity',
+        snapshot,
+      };
+    }
+    return {status: 'claimable'};
+  }
+  if (snapshot.owner === undefined) {
+    return {
+      status: 'blocked',
+      reason: 'invalid-owner-metadata',
+      snapshot,
+    };
+  }
+  if (snapshot.owner.hostname !== localHostname) {
+    return {status: 'claimable'};
   }
   try {
-    process.kill(snapshot.ownerPid, 0);
-    return false;
+    process.kill(snapshot.owner.pid, 0);
+    return {
+      status: 'blocked',
+      reason: 'owner-alive',
+      snapshot,
+    };
   } catch (error) {
-    return isErrorWithCode(error, 'ESRCH');
+    if (isErrorWithCode(error, 'ESRCH')) {
+      return {status: 'claimable'};
+    }
+    return {
+      status: 'blocked',
+      reason: 'owner-unverifiable',
+      snapshot,
+    };
   }
+}
+
+function formatInstallLockWarning(
+  lockPath: string,
+  result: InstallLockBlockedResult,
+): string {
+  let reason: string;
+  switch (result.reason) {
+    case 'invalid-owner-metadata':
+      reason = 'the stale heartbeat has invalid owner metadata';
+      break;
+    case 'owner-alive': {
+      const owner = result.snapshot.fromHeartbeat
+        ? result.snapshot.owner
+        : undefined;
+      reason = `process ${owner?.pid} on ${owner?.hostname} appears to still be running`;
+      break;
+    }
+    case 'owner-unverifiable': {
+      const owner = result.snapshot.fromHeartbeat
+        ? result.snapshot.owner
+        : undefined;
+      reason = `process ${owner?.pid} on ${owner?.hostname} could not be checked safely`;
+      break;
+    }
+    case 'unreliable-lock-identity':
+      reason = 'the filesystem did not provide a reliable lock birth time';
+      break;
+    case 'unstable-lock-identity':
+      reason = 'the filesystem changed the lock birth time during recovery';
+      break;
+  }
+  const ageSeconds = Math.max(
+    0,
+    Math.round((Date.now() - result.snapshot.mtimeMs) / 1000),
+  );
+  return [
+    `Cannot safely claim the stale browser install lock at ${lockPath}.`,
+    `Reason: ${reason}.`,
+    `Observed lock age: ${ageSeconds}s.`,
+    'Verify that no browser installation is still using this cache. If none is running, stop this process, remove the lock directory, and retry.',
+  ].join('\n');
 }
 
 async function claimStaleInstallLock(
   lockPath: string,
   staleThreshold: number,
+  owner: InstallLockOwner,
+  cleanupOptions: InstallLockCleanupOptions,
+  logger?: LoggerFunction,
   beforeStaleLockClaim?: () => Promise<void>,
-): Promise<boolean> {
+): Promise<InstallLockClaimResult> {
   const reaperPath = path.join(lockPath, 'reaper');
   try {
     const initialSnapshot = await inspectInstallLock(lockPath, staleThreshold);
-    if (
-      initialSnapshot === undefined ||
-      !canClaimInstallLock(initialSnapshot, staleThreshold)
-    ) {
-      return false;
+    if (initialSnapshot === undefined) {
+      return {status: 'retry'};
+    }
+    const initialClaimability = installLockClaimability(
+      initialSnapshot,
+      staleThreshold,
+      owner.hostname,
+    );
+    if (initialClaimability.status !== 'claimable') {
+      return initialClaimability;
     }
     await beforeStaleLockClaim?.();
-    debugInstall?.(`Claiming stale browser install lock at ${lockPath}`);
+    logger?.(`Claiming stale browser install lock at ${lockPath}`);
     try {
       await mkdir(reaperPath);
     } catch (error) {
       if (isErrorWithCode(error, 'EEXIST')) {
         const reaperStats = await stat(reaperPath);
         if (Date.now() - reaperStats.mtimeMs > staleThreshold) {
-          await rm(reaperPath, {recursive: true, force: true});
+          await removeInstallLockPath(reaperPath, cleanupOptions);
         }
-        return false;
+        return {status: 'retry'};
       }
       if (isErrorWithCode(error, 'ENOENT')) {
-        return false;
+        return {status: 'retry'};
       }
       throw error;
     }
+    let claimed = false;
     try {
       if (initialSnapshot.fromHeartbeat) {
         const currentSnapshot = await inspectInstallLock(
           lockPath,
           staleThreshold,
         );
-        if (
-          currentSnapshot === undefined ||
-          !canClaimInstallLock(currentSnapshot, staleThreshold)
-        ) {
-          return false;
+        if (currentSnapshot === undefined) {
+          return {status: 'retry'};
+        }
+        const currentClaimability = installLockClaimability(
+          currentSnapshot,
+          staleThreshold,
+          owner.hostname,
+        );
+        if (currentClaimability.status !== 'claimable') {
+          return currentClaimability;
         }
       } else {
         const currentHeartbeatStats = await statHeartbeat(lockPath);
         if (currentHeartbeatStats !== undefined) {
-          return false;
+          return {status: 'retry'};
         }
         const currentLockIdentity = await installLockIdentity(lockPath);
-        if (
-          !isSameInstallLock(
-            initialSnapshot.lockIdentity,
-            currentLockIdentity,
-          ) ||
-          !canClaimInstallLock(initialSnapshot, staleThreshold)
-        ) {
-          return false;
+        const identityComparison = compareInstallLockIdentity(
+          initialSnapshot.lockIdentity,
+          currentLockIdentity,
+        );
+        if (identityComparison === 'recreated') {
+          return {status: 'retry'};
+        }
+        if (identityComparison === 'unstable') {
+          // Creating the reaper changes ctime. If birth time changes with it,
+          // it cannot safely identify this directory across an ABA race.
+          return {
+            status: 'blocked',
+            reason: 'unstable-lock-identity',
+            snapshot: initialSnapshot,
+          };
+        }
+        const currentClaimability = installLockClaimability(
+          initialSnapshot,
+          staleThreshold,
+          owner.hostname,
+        );
+        if (currentClaimability.status !== 'claimable') {
+          return currentClaimability;
         }
       }
-      await refreshInstallLock(lockPath);
-      return true;
+      await refreshInstallLock(lockPath, owner);
+      claimed = true;
+      return {status: 'claimed'};
     } finally {
-      await rm(reaperPath, {recursive: true, force: true});
+      try {
+        await removeInstallLockPath(reaperPath, cleanupOptions);
+      } catch (error) {
+        if (!claimed) {
+          throw error;
+        }
+        logger?.(`Failed to remove browser install lock reaper: ${error}`);
+      }
     }
   } catch (error) {
     if (isErrorWithCode(error, 'ENOENT')) {
-      return false;
+      return {status: 'retry'};
     }
     throw error;
   }
 }
 
-async function refreshInstallLock(lockPath: string): Promise<void> {
-  await writeFile(path.join(lockPath, 'heartbeat'), `${process.pid}\n`);
+async function refreshInstallLock(
+  lockPath: string,
+  owner: InstallLockOwner,
+): Promise<void> {
+  await writeFile(
+    path.join(lockPath, 'heartbeat'),
+    `${JSON.stringify(owner)}\n`,
+  );
 }
 
 export async function withInstallLock<T>(
@@ -250,7 +452,21 @@ export async function withInstallLock<T>(
     options.staleThreshold ?? DEFAULT_INSTALL_LOCK_STALE_THRESHOLD;
   const heartbeatInterval =
     options.heartbeatInterval ?? DEFAULT_INSTALL_LOCK_HEARTBEAT_INTERVAL;
+  const cleanupOptions = {
+    maxRetries:
+      options.cleanupMaxRetries ?? DEFAULT_INSTALL_LOCK_CLEANUP_MAX_RETRIES,
+    retryDelay:
+      options.cleanupRetryDelay ?? DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY,
+  };
+  const logger = options.logger ?? debugInstall;
+  const warningLogger = options.logger ?? console.warn;
+  const owner = {
+    hostname: os.hostname(),
+    pid: process.pid,
+  };
   const lockParent = path.dirname(lockPath);
+  let loggedContention = false;
+  let warnedBlockedLock = false;
   await mkdir(lockParent, {recursive: true});
   while (true) {
     try {
@@ -263,31 +479,49 @@ export async function withInstallLock<T>(
       if (!isErrorWithCode(error, 'EEXIST')) {
         throw error;
       }
-      if (
-        await claimStaleInstallLock(
-          lockPath,
-          staleThreshold,
-          options.beforeStaleLockClaim,
-        )
-      ) {
+      const claimResult = await claimStaleInstallLock(
+        lockPath,
+        staleThreshold,
+        owner,
+        cleanupOptions,
+        logger,
+        options.beforeStaleLockClaim,
+      );
+      if (claimResult.status === 'claimed') {
         break;
+      }
+      if (claimResult.status === 'blocked' && !warnedBlockedLock) {
+        warningLogger(formatInstallLockWarning(lockPath, claimResult));
+        warnedBlockedLock = true;
+      }
+      if (!loggedContention) {
+        logger?.(`Waiting for browser install lock at ${lockPath}`);
+        loggedContention = true;
       }
       await sleep(retryDelay);
       continue;
     }
     try {
-      await refreshInstallLock(lockPath);
+      await refreshInstallLock(lockPath, owner);
     } catch (error) {
-      await rm(lockPath, {recursive: true, force: true});
+      await removeInstallLockPath(lockPath, cleanupOptions);
       throw error;
     }
     break;
   }
 
+  let heartbeatRefresh: Promise<void> | undefined;
   const heartbeat = setInterval(() => {
-    void refreshInstallLock(lockPath).catch(error => {
-      debugInstall?.(`Failed to refresh browser install lock: ${error}`);
-    });
+    if (heartbeatRefresh !== undefined) {
+      return;
+    }
+    heartbeatRefresh = refreshInstallLock(lockPath, owner)
+      .catch(error => {
+        logger?.(`Failed to refresh browser install lock: ${error}`);
+      })
+      .finally(() => {
+        heartbeatRefresh = undefined;
+      });
   }, heartbeatInterval);
   heartbeat.unref();
 
@@ -295,6 +529,7 @@ export async function withInstallLock<T>(
     return await task();
   } finally {
     clearInterval(heartbeat);
-    await rm(lockPath, {recursive: true, force: true});
+    await heartbeatRefresh;
+    await removeInstallLockPath(lockPath, cleanupOptions);
   }
 }

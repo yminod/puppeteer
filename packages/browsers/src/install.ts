@@ -395,6 +395,11 @@ async function installUrl(
     platform,
     options.buildId,
   );
+  const withBrowserInstallLock = <T>(task: () => Promise<T>): Promise<T> => {
+    return withInstallLock(lockPath, task, {
+      logger: logger?.(DEBUG_PREFIXES.install),
+    });
+  };
   if (!existsSync(browserRoot)) {
     await mkdir(browserRoot, {recursive: true});
   }
@@ -406,7 +411,7 @@ async function installUrl(
   }
 
   if (!options.unpack) {
-    return await withInstallLock(lockPath, async () => {
+    return await withBrowserInstallLock(async () => {
       if (existsSync(archivePath)) {
         return archivePath;
       }
@@ -445,7 +450,7 @@ async function installUrl(
     `Using executable path from provider: ${relativeExecutablePath}`,
   );
 
-  return await withInstallLock(lockPath, async () => {
+  return await withBrowserInstallLock(async () => {
     // Write metadata for the installation (only for non-default providers)
     if (!(provider instanceof DefaultProvider)) {
       cache.writeExecutablePath(
