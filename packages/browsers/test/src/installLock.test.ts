@@ -135,7 +135,7 @@ describe('installLock', function () {
     assert.strictEqual(fs.existsSync(lockParent), true);
   });
 
-  it('does not read malformed metadata from a fresh heartbeat', async () => {
+  it('waits without warning when a fresh heartbeat has malformed metadata', async () => {
     fs.mkdirSync(lockPath, {recursive: true});
     fs.writeFileSync(path.join(lockPath, 'heartbeat'), '{');
     let lockEntered = false;
@@ -176,29 +176,54 @@ describe('installLock', function () {
     assert.strictEqual(lockEntered, true);
   });
 
-  it('claims stale locks owned on another host without probing the PID', async () => {
-    writeStaleOwnerHeartbeat(process.pid, `${os.hostname()}-remote`);
+  it('warns instead of claiming stale locks owned on another host', async () => {
+    const remoteHostname = `${os.hostname()}-remote`;
+    writeStaleOwnerHeartbeat(process.pid, remoteHostname);
+    let lockEntered = false;
     const messages: string[] = [];
+    const warningObserved = Promise.withResolvers<void>();
 
-    await withInstallLock(lockPath, async () => {}, {
-      ...testLockOptions,
-      logger: message => {
-        messages.push(String(message));
+    const lock = withInstallLock(
+      lockPath,
+      async () => {
+        lockEntered = true;
       },
-    });
+      {
+        ...testLockOptions,
+        logger: message => {
+          const text = String(message);
+          messages.push(text);
+          if (text.startsWith('Cannot safely claim')) {
+            warningObserved.resolve();
+          }
+        },
+      },
+    );
 
-    assert.strictEqual(
-      messages.some(message => {
-        return message.startsWith('Waiting for browser install lock');
-      }),
-      false,
-    );
-    assert.strictEqual(
-      messages.some(message => {
+    try {
+      await warningObserved.promise;
+      await sleep(20);
+      assert.strictEqual(lockEntered, false);
+      const warnings = messages.filter(message => {
         return message.startsWith('Cannot safely claim');
-      }),
-      false,
-    );
+      });
+      assert.strictEqual(warnings.length, 1);
+      assert.ok(warnings[0]!.includes(remoteHostname));
+      assert.match(warnings[0]!, /could not be checked safely/);
+      assert.strictEqual(
+        messages.filter(message => {
+          return message.startsWith('Waiting for browser install lock');
+        }).length,
+        1,
+      );
+    } finally {
+      fs.rmSync(lockPath, {recursive: true, force: true});
+      await lock;
+    }
+
+    assert.strictEqual(lockEntered, true);
+    assert.strictEqual(fs.existsSync(lockPath), false);
+    assert.strictEqual(fs.existsSync(lockParent), true);
   });
 
   it('warns instead of claiming stale locks with invalid owner metadata', async () => {

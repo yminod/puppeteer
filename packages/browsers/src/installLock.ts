@@ -137,6 +137,9 @@ async function removeInstallLockPath(
   targetPath: string,
   options: InstallLockCleanupOptions,
 ): Promise<void> {
+  // Recursive rm() retries ENOTEMPTY against the same path, so it may remove a
+  // replacement lock created during cleanup. Keep retries bounded; identity
+  // checks cannot make deletion atomic.
   await rm(targetPath, {
     recursive: true,
     force: true,
@@ -212,9 +215,9 @@ async function inspectInstallLock(
 export function hasUsableInstallLockBirthtime(
   identity: InstallLockIdentity,
 ): boolean {
-  // Some filesystems report zero when birth time is unavailable. libuv may also
-  // synthesize it from ctime, making revalidation depend on filesystem timestamp
-  // resolution.
+  // Some filesystems report zero when birth time is unavailable. A non-zero value
+  // may instead be ctime, so it is revalidated after creating the reaper; see
+  // claimStaleInstallLock().
   return identity.birthtimeNs > 0n;
 }
 
@@ -260,7 +263,11 @@ function installLockClaimability(
     };
   }
   if (snapshot.owner.hostname !== localHostname) {
-    return {status: 'claimable'};
+    return {
+      status: 'blocked',
+      reason: 'owner-unverifiable',
+      snapshot,
+    };
   }
   try {
     process.kill(snapshot.owner.pid, 0);
