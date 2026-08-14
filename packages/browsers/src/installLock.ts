@@ -29,6 +29,7 @@ interface InstallLockOptions {
   cleanupMaxRetries?: number;
   cleanupRetryDelay?: number;
   logger?: LoggerFunction;
+  warningLogger?: LoggerFunction;
   /**
    * @internal
    */
@@ -80,6 +81,32 @@ type InstallLockClaimResult =
 interface InstallLockCleanupOptions {
   maxRetries: number;
   retryDelay: number;
+}
+
+/**
+ * @internal
+ */
+export interface InstallLockContext {
+  recoveredStaleLock: boolean;
+}
+
+/**
+ * @internal
+ */
+export class InstallLockError extends Error {
+  readonly lockPath: string;
+  readonly reason: InstallLockBlockReason;
+
+  constructor(
+    lockPath: string,
+    reason: InstallLockBlockReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'InstallLockError';
+    this.lockPath = lockPath;
+    this.reason = reason;
+  }
 }
 
 export function installLockPath(
@@ -326,7 +353,20 @@ function formatInstallLockWarning(
     `Cannot safely claim the stale browser install lock at ${lockPath}.`,
     `Reason: ${reason}.`,
     `Observed lock age: ${ageSeconds}s.`,
-    'Verify that no browser installation is still using this cache. If none is running, stop this process, remove the lock directory, and retry.',
+    'The browser installation task was not started and this lock was not claimed.',
+    'Verify that no browser installation or related helper is still using this cache. If none is running, remove the lock directory and retry.',
+  ].join('\n');
+}
+
+function formatInstallLockContention(
+  lockPath: string,
+  staleThreshold: number,
+): string {
+  const staleSeconds = Math.ceil(staleThreshold / 1000);
+  return [
+    `Waiting for browser install lock at ${lockPath}.`,
+    'Another browser installation may still be using this cache.',
+    `If the previous installation was interrupted, Puppeteer checks whether stale-lock recovery is safe once the lock heartbeat is more than ${staleSeconds}s old.`,
   ].join('\n');
 }
 
@@ -451,7 +491,7 @@ async function refreshInstallLock(
 
 export async function withInstallLock<T>(
   lockPath: string,
-  task: () => Promise<T>,
+  task: (context: InstallLockContext) => Promise<T>,
   options: InstallLockOptions = {},
 ): Promise<T> {
   const retryDelay = options.retryDelay ?? DEFAULT_INSTALL_LOCK_RETRY_DELAY;
@@ -466,14 +506,14 @@ export async function withInstallLock<T>(
       options.cleanupRetryDelay ?? DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY,
   };
   const logger = options.logger ?? debugInstall;
-  const warningLogger = options.logger ?? console.warn;
+  const warningLogger = options.warningLogger ?? console.warn;
   const owner = {
     hostname: os.hostname(),
     pid: process.pid,
   };
   const lockParent = path.dirname(lockPath);
   let loggedContention = false;
-  let warnedBlockedLock = false;
+  let recoveredStaleLock = false;
   await mkdir(lockParent, {recursive: true});
   while (true) {
     try {
@@ -495,14 +535,16 @@ export async function withInstallLock<T>(
         options.beforeStaleLockClaim,
       );
       if (claimResult.status === 'claimed') {
+        recoveredStaleLock = true;
         break;
       }
-      if (claimResult.status === 'blocked' && !warnedBlockedLock) {
-        warningLogger(formatInstallLockWarning(lockPath, claimResult));
-        warnedBlockedLock = true;
+      if (claimResult.status === 'blocked') {
+        const message = formatInstallLockWarning(lockPath, claimResult);
+        warningLogger(message);
+        throw new InstallLockError(lockPath, claimResult.reason, message);
       }
       if (!loggedContention) {
-        logger?.(`Waiting for browser install lock at ${lockPath}`);
+        warningLogger(formatInstallLockContention(lockPath, staleThreshold));
         loggedContention = true;
       }
       await sleep(retryDelay);
@@ -533,7 +575,7 @@ export async function withInstallLock<T>(
   heartbeat.unref();
 
   try {
-    return await task();
+    return await task({recoveredStaleLock});
   } finally {
     clearInterval(heartbeat);
     await heartbeatRefresh;

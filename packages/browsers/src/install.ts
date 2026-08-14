@@ -22,11 +22,76 @@ import {DefaultProvider} from './DefaultProvider.js';
 import {detectBrowserPlatform} from './detectPlatform.js';
 import {unpackArchive} from './fileUtil.js';
 import {downloadFile, headHttpRequest} from './httpUtil.js';
-import {installLockPath, withInstallLock} from './installLock.js';
+import {
+  InstallLockError,
+  installLockPath,
+  withInstallLock,
+} from './installLock.js';
 import {ProgressBar} from './ProgressBar.js';
 import type {BrowserProvider} from './provider.js';
 
 const times = new Map<string, [number, number]>();
+
+interface BrowserInstallPaths {
+  lockPath: string;
+  archivePath: string;
+  outputPath?: string;
+  executablePath?: string;
+}
+
+class BrowserInstallError extends Error {
+  constructor(message: string, options: ErrorOptions) {
+    super(message, options);
+    this.name = 'BrowserInstallError';
+  }
+}
+
+function formatBrowserInstallPaths(paths: BrowserInstallPaths): string[] {
+  const result = [
+    `Lock path: ${paths.lockPath}`,
+    `Archive path: ${paths.archivePath}`,
+  ];
+  if (paths.outputPath !== undefined) {
+    result.push(`Output path: ${paths.outputPath}`);
+  }
+  if (paths.executablePath !== undefined) {
+    result.push(`Executable path: ${paths.executablePath}`);
+  }
+  return result;
+}
+
+function browserInstallLockError(
+  error: InstallLockError,
+  paths: BrowserInstallPaths,
+): BrowserInstallError {
+  return new BrowserInstallError(
+    [
+      'Browser installation could not proceed because its install lock could not be claimed safely.',
+      ...formatBrowserInstallPaths(paths),
+      error.message,
+    ].join('\n'),
+    {cause: error},
+  );
+}
+
+function browserInstallRecoveryError(
+  error: unknown,
+  paths: BrowserInstallPaths,
+): BrowserInstallError {
+  const originalMessage =
+    error instanceof Error ? error.message : String(error);
+  return new BrowserInstallError(
+    [
+      'Browser installation failed after recovering a stale install lock.',
+      'The previous installation may have been interrupted and may have left partial state.',
+      ...formatBrowserInstallPaths(paths),
+      `Original error: ${originalMessage}`,
+      'Verify that no browser installation or related helper is still using this cache before modifying or removing these paths, then retry.',
+    ].join('\n'),
+    {cause: error},
+  );
+}
+
 function debugTime(label: string) {
   times.set(label, process.hrtime());
 }
@@ -254,6 +319,9 @@ async function installWithProviders(
       // Download and install using the URL from the provider
       return await installUrl(url, options, provider, logger);
     } catch (err) {
+      if (err instanceof BrowserInstallError) {
+        throw err;
+      }
       logger?.(DEBUG_PREFIXES.install)?.(
         `Provider ${provider.getName()} failed: ${(err as Error).message}`,
       );
@@ -395,10 +463,37 @@ async function installUrl(
     platform,
     options.buildId,
   );
-  const withBrowserInstallLock = <T>(task: () => Promise<T>): Promise<T> => {
-    return withInstallLock(lockPath, task, {
-      logger: logger?.(DEBUG_PREFIXES.install),
-    });
+  const installLogger = logger?.(DEBUG_PREFIXES.install);
+  const withBrowserInstallLock = async <T>(
+    task: () => Promise<T>,
+    paths: BrowserInstallPaths,
+  ): Promise<T> => {
+    let recoveredStaleLock = false;
+    try {
+      return await withInstallLock(
+        lockPath,
+        async context => {
+          recoveredStaleLock = context.recoveredStaleLock;
+          return await task();
+        },
+        {
+          logger: installLogger,
+          warningLogger: installLogger,
+        },
+      );
+    } catch (error) {
+      if (error instanceof InstallLockError) {
+        throw browserInstallLockError(error, paths);
+      }
+      if (recoveredStaleLock) {
+        throw browserInstallRecoveryError(error, paths);
+      }
+      throw error;
+    }
+  };
+  const archiveInstallPaths = {
+    lockPath,
+    archivePath,
   };
   if (!existsSync(browserRoot)) {
     await mkdir(browserRoot, {recursive: true});
@@ -431,7 +526,7 @@ async function installUrl(
         debugTimeEnd('download', logger);
       }
       return archivePath;
-    });
+    }, archiveInstallPaths);
   }
 
   const outputPath = cache.installationDir(
@@ -450,7 +545,17 @@ async function installUrl(
     `Using executable path from provider: ${relativeExecutablePath}`,
   );
 
-  return await withBrowserInstallLock(async () => {
+  const withUnpackedBrowserInstallLock = <T>(
+    task: () => Promise<T>,
+  ): Promise<T> => {
+    return withBrowserInstallLock(task, {
+      ...archiveInstallPaths,
+      outputPath,
+      executablePath: path.join(outputPath, relativeExecutablePath),
+    });
+  };
+
+  return await withUnpackedBrowserInstallLock(async () => {
     // Write metadata for the installation (only for non-default providers)
     if (!(provider instanceof DefaultProvider)) {
       cache.writeExecutablePath(

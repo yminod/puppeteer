@@ -5,6 +5,8 @@
  */
 
 import assert from 'node:assert';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -38,6 +40,53 @@ describe('Chrome install', () => {
   afterEach(() => {
     new Cache(tmpDir).clear();
   });
+
+  async function exitedProcessPid(): Promise<number> {
+    const child = spawn(process.execPath, ['-e', ''], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    const exited = once(child, 'exit');
+    const pid = child.pid;
+    assert.ok(pid);
+    await exited;
+    return pid;
+  }
+
+  function expectedInstallPaths() {
+    const browserRoot = path.join(tmpDir, 'chrome');
+    return {
+      archivePath: path.join(
+        browserRoot,
+        `${testChromeBuildId}-chrome-linux64.zip`,
+      ),
+      executablePath: computeExecutablePath({
+        cacheDir: tmpDir,
+        browser: Browser.CHROME,
+        platform: BrowserPlatform.LINUX,
+        buildId: testChromeBuildId,
+      }),
+      lockPath: path.join(
+        browserRoot,
+        `.installLock-${BrowserPlatform.LINUX}-${testChromeBuildId}`,
+      ),
+      outputPath: path.join(
+        browserRoot,
+        `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
+      ),
+    };
+  }
+
+  function writeStaleInstallLock(
+    lockPath: string,
+    owner: {hostname: string; pid: number},
+  ): void {
+    fs.mkdirSync(lockPath, {recursive: true});
+    const heartbeatPath = path.join(lockPath, 'heartbeat');
+    fs.writeFileSync(heartbeatPath, `${JSON.stringify(owner)}\n`);
+    const staleTime = new Date(Date.now() - 6 * 60 * 1000);
+    fs.utimesSync(heartbeatPath, staleTime, staleTime);
+  }
 
   it('should check if a buildId can be downloaded', async () => {
     assert.ok(
@@ -99,7 +148,97 @@ describe('Chrome install', () => {
       error?.message.includes(expectedMessage),
       `Expected error message to contain "${expectedMessage}" but got "${error?.message}"`,
     );
+    assert.doesNotMatch(
+      error?.message ?? '',
+      /recovering a stale install lock/,
+    );
     assert.strictEqual(fs.existsSync(expectedOutputPath), true);
+  });
+
+  it('adds paths and interruption context after stale-lock recovery', async function () {
+    this.timeout(60000);
+    const {archivePath, executablePath, lockPath, outputPath} =
+      expectedInstallPaths();
+    fs.mkdirSync(outputPath, {recursive: true});
+    writeStaleInstallLock(lockPath, {
+      hostname: os.hostname(),
+      pid: await exitedProcessPid(),
+    });
+
+    let error: Error | undefined;
+    try {
+      await install({
+        cacheDir: tmpDir,
+        browser: Browser.CHROME,
+        platform: BrowserPlatform.LINUX,
+        buildId: testChromeBuildId,
+      });
+    } catch (cause) {
+      assert(cause instanceof Error);
+      error = cause;
+    }
+
+    assert(error);
+    assert.match(
+      error.message,
+      /Browser installation failed after recovering a stale install lock/,
+    );
+    assert.match(
+      error.message,
+      /previous installation may have been interrupted/i,
+    );
+    assert.ok(error.message.includes(`Lock path: ${lockPath}`));
+    assert.ok(error.message.includes(`Archive path: ${archivePath}`));
+    assert.ok(error.message.includes(`Output path: ${outputPath}`));
+    assert.ok(error.message.includes(`Executable path: ${executablePath}`));
+    assert.match(error.message, /Original error: .*executable .* is missing/);
+    assert.match(error.message, /no browser installation or related helper/);
+    assert.strictEqual(fs.existsSync(outputPath), true);
+    assert.strictEqual(fs.existsSync(lockPath), false);
+  });
+
+  it('returns an unsafe stale-lock error without provider aggregation', async function () {
+    this.timeout(60000);
+    const {archivePath, executablePath, lockPath, outputPath} =
+      expectedInstallPaths();
+    writeStaleInstallLock(lockPath, {
+      hostname: `${os.hostname()}-remote`,
+      pid: process.pid,
+    });
+    const messages: string[] = [];
+
+    let error: Error | undefined;
+    try {
+      await install({
+        cacheDir: tmpDir,
+        browser: Browser.CHROME,
+        platform: BrowserPlatform.LINUX,
+        buildId: testChromeBuildId,
+        logger: () => {
+          return message => {
+            messages.push(String(message));
+          };
+        },
+      });
+    } catch (cause) {
+      assert(cause instanceof Error);
+      error = cause;
+    }
+
+    assert(error);
+    assert.match(error.message, /install lock could not be claimed safely/);
+    assert.ok(error.message.includes(`Lock path: ${lockPath}`));
+    assert.ok(error.message.includes(`Archive path: ${archivePath}`));
+    assert.ok(error.message.includes(`Output path: ${outputPath}`));
+    assert.ok(error.message.includes(`Executable path: ${executablePath}`));
+    assert.doesNotMatch(error.message, /All providers failed/);
+    assert.strictEqual(
+      messages.filter(message => {
+        return message.startsWith('Cannot safely claim');
+      }).length,
+      1,
+    );
+    assert.strictEqual(fs.existsSync(lockPath), true);
   });
 
   it('does not list install lock directories as installed browsers', () => {
