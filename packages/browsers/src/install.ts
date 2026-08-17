@@ -32,61 +32,33 @@ import type {BrowserProvider} from './provider.js';
 
 const times = new Map<string, [number, number]>();
 
-interface BrowserInstallPaths {
-  lockPath: string;
-  archivePath: string;
-  outputPath?: string;
-  executablePath?: string;
-}
-
-class BrowserInstallError extends Error {
-  constructor(message: string, options: ErrorOptions) {
-    super(message, options);
-    this.name = 'BrowserInstallError';
-  }
-}
-
-function formatBrowserInstallPaths(paths: BrowserInstallPaths): string[] {
-  const result = [
-    `Lock path: ${paths.lockPath}`,
-    `Archive path: ${paths.archivePath}`,
-  ];
-  if (paths.outputPath !== undefined) {
-    result.push(`Output path: ${paths.outputPath}`);
-  }
-  if (paths.executablePath !== undefined) {
-    result.push(`Executable path: ${paths.executablePath}`);
-  }
-  return result;
-}
-
 function browserInstallLockError(
   error: InstallLockError,
-  paths: BrowserInstallPaths,
-): BrowserInstallError {
-  return new BrowserInstallError(
+  options: InstallOptions,
+): Error {
+  const lockState: string[] = [];
+  if (error.reason !== undefined) {
+    lockState.push(`Last blocked reason: ${error.reason}.`);
+  }
+  if (error.owner !== undefined) {
+    lockState.push(
+      `Recorded owner: process ${error.owner.pid} on ${error.owner.hostname}.`,
+    );
+  }
+  if (error.observedAgeMs !== undefined) {
+    lockState.push(
+      `Observed lock age: ${Math.max(0, Math.round(error.observedAgeMs / 1000))}s.`,
+    );
+  }
+  return new Error(
     [
-      'Browser installation could not proceed because its install lock could not be claimed safely.',
-      ...formatBrowserInstallPaths(paths),
+      'Browser installation timed out while waiting for its install lock.',
+      `Cache path: ${options.cacheDir}`,
+      `Lock path: ${error.lockPath}`,
       error.message,
-    ].join('\n'),
-    {cause: error},
-  );
-}
-
-function browserInstallRecoveryError(
-  error: unknown,
-  paths: BrowserInstallPaths,
-): BrowserInstallError {
-  const originalMessage =
-    error instanceof Error ? error.message : String(error);
-  return new BrowserInstallError(
-    [
-      'Browser installation failed after recovering a stale install lock.',
-      'The previous installation may have been interrupted and may have left partial state.',
-      ...formatBrowserInstallPaths(paths),
-      `Original error: ${originalMessage}`,
-      'Verify that no browser installation or related helper is still using this cache before modifying or removing these paths, then retry.',
+      ...lockState,
+      'The browser installation task was not started, and Puppeteer did not claim or remove the existing lock.',
+      'Verify that no browser installation or related helper is still using this cache. If none is running, remove the lock directory and retry.',
     ].join('\n'),
     {cause: error},
   );
@@ -165,6 +137,12 @@ export interface InstallOptions {
    * @defaultValue `false`
    */
   forceFallbackForTesting?: boolean;
+  /**
+   * Contention budget in milliseconds for the browser install lock.
+   *
+   * @internal
+   */
+  installLockTimeout?: number;
 
   /**
    * Whether to attempt to install system-level dependencies required
@@ -319,8 +297,8 @@ async function installWithProviders(
       // Download and install using the URL from the provider
       return await installUrl(url, options, provider, logger);
     } catch (err) {
-      if (err instanceof BrowserInstallError) {
-        throw err;
+      if (err instanceof InstallLockError) {
+        throw browserInstallLockError(err, options);
       }
       logger?.(DEBUG_PREFIXES.install)?.(
         `Provider ${provider.getName()} failed: ${(err as Error).message}`,
@@ -464,36 +442,12 @@ async function installUrl(
     options.buildId,
   );
   const installLogger = logger?.(DEBUG_PREFIXES.install);
-  const withBrowserInstallLock = async <T>(
-    task: () => Promise<T>,
-    paths: BrowserInstallPaths,
-  ): Promise<T> => {
-    let recoveredStaleLock = false;
-    try {
-      return await withInstallLock(
-        lockPath,
-        async context => {
-          recoveredStaleLock = context.recoveredStaleLock;
-          return await task();
-        },
-        {
-          logger: installLogger,
-          warningLogger: installLogger,
-        },
-      );
-    } catch (error) {
-      if (error instanceof InstallLockError) {
-        throw browserInstallLockError(error, paths);
-      }
-      if (recoveredStaleLock) {
-        throw browserInstallRecoveryError(error, paths);
-      }
-      throw error;
-    }
-  };
-  const archiveInstallPaths = {
-    lockPath,
-    archivePath,
+  const withBrowserInstallLock = <T>(task: () => Promise<T>): Promise<T> => {
+    return withInstallLock(lockPath, task, {
+      acquisitionTimeout: options.installLockTimeout,
+      logger: installLogger,
+      warningLogger: installLogger,
+    });
   };
   if (!existsSync(browserRoot)) {
     await mkdir(browserRoot, {recursive: true});
@@ -526,7 +480,7 @@ async function installUrl(
         debugTimeEnd('download', logger);
       }
       return archivePath;
-    }, archiveInstallPaths);
+    });
   }
 
   const outputPath = cache.installationDir(
@@ -545,17 +499,7 @@ async function installUrl(
     `Using executable path from provider: ${relativeExecutablePath}`,
   );
 
-  const withUnpackedBrowserInstallLock = <T>(
-    task: () => Promise<T>,
-  ): Promise<T> => {
-    return withBrowserInstallLock(task, {
-      ...archiveInstallPaths,
-      outputPath,
-      executablePath: path.join(outputPath, relativeExecutablePath),
-    });
-  };
-
-  return await withUnpackedBrowserInstallLock(async () => {
+  return await withBrowserInstallLock(async () => {
     // Write metadata for the installation (only for non-default providers)
     if (!(provider instanceof DefaultProvider)) {
       cache.writeExecutablePath(

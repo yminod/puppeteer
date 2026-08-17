@@ -5,8 +5,6 @@
  */
 
 import assert from 'node:assert';
-import {spawn} from 'node:child_process';
-import {once} from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -41,40 +39,12 @@ describe('Chrome install', () => {
     new Cache(tmpDir).clear();
   });
 
-  async function exitedProcessPid(): Promise<number> {
-    const child = spawn(process.execPath, ['-e', ''], {
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    const exited = once(child, 'exit');
-    const pid = child.pid;
-    assert.ok(pid);
-    await exited;
-    return pid;
-  }
-
-  function expectedInstallPaths() {
-    const browserRoot = path.join(tmpDir, 'chrome');
-    return {
-      archivePath: path.join(
-        browserRoot,
-        `${testChromeBuildId}-chrome-linux64.zip`,
-      ),
-      executablePath: computeExecutablePath({
-        cacheDir: tmpDir,
-        browser: Browser.CHROME,
-        platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
-      }),
-      lockPath: path.join(
-        browserRoot,
-        `.installLock-${BrowserPlatform.LINUX}-${testChromeBuildId}`,
-      ),
-      outputPath: path.join(
-        browserRoot,
-        `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
-      ),
-    };
+  function expectedInstallLockPath(): string {
+    return path.join(
+      tmpDir,
+      'chrome',
+      `.installLock-${BrowserPlatform.LINUX}-${testChromeBuildId}`,
+    );
   }
 
   function writeStaleInstallLock(
@@ -155,52 +125,9 @@ describe('Chrome install', () => {
     assert.strictEqual(fs.existsSync(expectedOutputPath), true);
   });
 
-  it('adds paths and interruption context after stale-lock recovery', async function () {
+  it('returns install-lock timeout guidance without provider aggregation', async function () {
     this.timeout(60000);
-    const {archivePath, executablePath, lockPath, outputPath} =
-      expectedInstallPaths();
-    fs.mkdirSync(outputPath, {recursive: true});
-    writeStaleInstallLock(lockPath, {
-      hostname: os.hostname(),
-      pid: await exitedProcessPid(),
-    });
-
-    let error: Error | undefined;
-    try {
-      await install({
-        cacheDir: tmpDir,
-        browser: Browser.CHROME,
-        platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
-      });
-    } catch (cause) {
-      assert(cause instanceof Error);
-      error = cause;
-    }
-
-    assert(error);
-    assert.match(
-      error.message,
-      /Browser installation failed after recovering a stale install lock/,
-    );
-    assert.match(
-      error.message,
-      /previous installation may have been interrupted/i,
-    );
-    assert.ok(error.message.includes(`Lock path: ${lockPath}`));
-    assert.ok(error.message.includes(`Archive path: ${archivePath}`));
-    assert.ok(error.message.includes(`Output path: ${outputPath}`));
-    assert.ok(error.message.includes(`Executable path: ${executablePath}`));
-    assert.match(error.message, /Original error: .*executable .* is missing/);
-    assert.match(error.message, /no browser installation or related helper/);
-    assert.strictEqual(fs.existsSync(outputPath), true);
-    assert.strictEqual(fs.existsSync(lockPath), false);
-  });
-
-  it('returns an unsafe stale-lock error without provider aggregation', async function () {
-    this.timeout(60000);
-    const {archivePath, executablePath, lockPath, outputPath} =
-      expectedInstallPaths();
+    const lockPath = expectedInstallLockPath();
     writeStaleInstallLock(lockPath, {
       hostname: `${os.hostname()}-remote`,
       pid: process.pid,
@@ -214,6 +141,7 @@ describe('Chrome install', () => {
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
         buildId: testChromeBuildId,
+        installLockTimeout: 0,
         logger: () => {
           return message => {
             messages.push(String(message));
@@ -226,11 +154,12 @@ describe('Chrome install', () => {
     }
 
     assert(error);
-    assert.match(error.message, /install lock could not be claimed safely/);
+    assert.match(error.message, /timed out while waiting for its install lock/);
+    assert.ok(error.message.includes(`Cache path: ${tmpDir}`));
     assert.ok(error.message.includes(`Lock path: ${lockPath}`));
-    assert.ok(error.message.includes(`Archive path: ${archivePath}`));
-    assert.ok(error.message.includes(`Output path: ${outputPath}`));
-    assert.ok(error.message.includes(`Executable path: ${executablePath}`));
+    assert.match(error.message, /Last blocked reason: owner-unverifiable/);
+    assert.match(error.message, /browser installation task was not started/i);
+    assert.match(error.message, /no browser installation or related helper/);
     assert.doesNotMatch(error.message, /All providers failed/);
     assert.strictEqual(
       messages.filter(message => {

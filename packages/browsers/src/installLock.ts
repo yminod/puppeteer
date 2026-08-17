@@ -17,14 +17,21 @@ import {debug, type LoggerFunction} from './debug.js';
 const debugInstall = debug('puppeteer:browsers:install');
 
 const DEFAULT_INSTALL_LOCK_RETRY_DELAY = 100;
-const DEFAULT_INSTALL_LOCK_STALE_THRESHOLD = 5 * 60 * 1000;
 const DEFAULT_INSTALL_LOCK_HEARTBEAT_INTERVAL = 10 * 1000;
+const DEFAULT_INSTALL_LOCK_STALE_THRESHOLD = 60 * 1000;
+const DEFAULT_INSTALL_LOCK_ACQUISITION_TIMEOUT = 15 * 60 * 1000;
 const DEFAULT_INSTALL_LOCK_CLEANUP_MAX_RETRIES = 5;
 const DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY = 100;
 
 interface InstallLockOptions {
   retryDelay?: number;
+  /** Maximum observed lock-state age before stale recovery is considered. */
   staleThreshold?: number;
+  /**
+   * Local contention budget. A safe claim found at the boundary takes
+   * precedence over timing out.
+   */
+  acquisitionTimeout?: number;
   heartbeatInterval?: number;
   cleanupMaxRetries?: number;
   cleanupRetryDelay?: number;
@@ -86,26 +93,30 @@ interface InstallLockCleanupOptions {
 /**
  * @internal
  */
-export interface InstallLockContext {
-  recoveredStaleLock: boolean;
-}
-
-/**
- * @internal
- */
 export class InstallLockError extends Error {
   readonly lockPath: string;
-  readonly reason: InstallLockBlockReason;
+  readonly waitedMs: number;
+  readonly reason: InstallLockBlockReason | undefined;
+  readonly owner: InstallLockOwner | undefined;
+  readonly observedAgeMs: number | undefined;
 
   constructor(
     lockPath: string,
-    reason: InstallLockBlockReason,
-    message: string,
+    waitedMs: number,
+    reason?: InstallLockBlockReason,
+    owner?: InstallLockOwner,
+    observedAgeMs?: number,
   ) {
-    super(message);
+    const waitedSeconds = Math.max(0, Math.round(waitedMs / 1000));
+    super(
+      `Timed out after ${waitedSeconds}s waiting for browser install lock at ${lockPath}.`,
+    );
     this.name = 'InstallLockError';
     this.lockPath = lockPath;
+    this.waitedMs = waitedMs;
     this.reason = reason;
+    this.owner = owner;
+    this.observedAgeMs = observedAgeMs;
   }
 }
 
@@ -239,9 +250,7 @@ async function inspectInstallLock(
 /**
  * @internal
  */
-export function hasUsableInstallLockBirthtime(
-  identity: InstallLockIdentity,
-): boolean {
+export function canUseBirthtime(identity: InstallLockIdentity): boolean {
   // Some filesystems report zero when birth time is unavailable. A non-zero value
   // may instead be ctime, so it is revalidated after creating the reaper; see
   // claimStaleInstallLock().
@@ -273,7 +282,7 @@ function installLockClaimability(
     return {status: 'retry'};
   }
   if (!snapshot.fromHeartbeat) {
-    if (!hasUsableInstallLockBirthtime(snapshot.lockIdentity)) {
+    if (!canUseBirthtime(snapshot.lockIdentity)) {
       return {
         status: 'blocked',
         reason: 'unreliable-lock-identity',
@@ -319,30 +328,31 @@ function formatInstallLockWarning(
   lockPath: string,
   result: InstallLockBlockedResult,
 ): string {
-  let reason: string;
+  let description: string;
   switch (result.reason) {
     case 'invalid-owner-metadata':
-      reason = 'the stale heartbeat has invalid owner metadata';
+      description = 'the stale heartbeat has invalid owner metadata';
       break;
     case 'owner-alive': {
       const owner = result.snapshot.fromHeartbeat
         ? result.snapshot.owner
         : undefined;
-      reason = `process ${owner?.pid} on ${owner?.hostname} appears to still be running`;
+      description = `process ${owner?.pid} on ${owner?.hostname} appears to still be running`;
       break;
     }
     case 'owner-unverifiable': {
       const owner = result.snapshot.fromHeartbeat
         ? result.snapshot.owner
         : undefined;
-      reason = `process ${owner?.pid} on ${owner?.hostname} could not be checked safely`;
+      description = `process ${owner?.pid} on ${owner?.hostname} could not be checked safely`;
       break;
     }
     case 'unreliable-lock-identity':
-      reason = 'the filesystem did not provide a reliable lock birth time';
+      description = 'the filesystem did not provide a reliable lock birth time';
       break;
     case 'unstable-lock-identity':
-      reason = 'the filesystem changed the lock birth time during recovery';
+      description =
+        'the filesystem changed the lock birth time during recovery';
       break;
   }
   const ageSeconds = Math.max(
@@ -351,22 +361,9 @@ function formatInstallLockWarning(
   );
   return [
     `Cannot safely claim the stale browser install lock at ${lockPath}.`,
-    `Reason: ${reason}.`,
+    `Reason: ${description}.`,
     `Observed lock age: ${ageSeconds}s.`,
-    'The browser installation task was not started and this lock was not claimed.',
-    'Verify that no browser installation or related helper is still using this cache. If none is running, remove the lock directory and retry.',
-  ].join('\n');
-}
-
-function formatInstallLockContention(
-  lockPath: string,
-  staleThreshold: number,
-): string {
-  const staleSeconds = Math.ceil(staleThreshold / 1000);
-  return [
-    `Waiting for browser install lock at ${lockPath}.`,
-    'Another browser installation may still be using this cache.',
-    `If the previous installation was interrupted, Puppeteer checks whether stale-lock recovery is safe once the lock heartbeat is more than ${staleSeconds}s old.`,
+    'The lock was not claimed; Puppeteer will continue waiting for it to be released.',
   ].join('\n');
 }
 
@@ -491,12 +488,14 @@ async function refreshInstallLock(
 
 export async function withInstallLock<T>(
   lockPath: string,
-  task: (context: InstallLockContext) => Promise<T>,
+  task: () => Promise<T>,
   options: InstallLockOptions = {},
 ): Promise<T> {
   const retryDelay = options.retryDelay ?? DEFAULT_INSTALL_LOCK_RETRY_DELAY;
   const staleThreshold =
     options.staleThreshold ?? DEFAULT_INSTALL_LOCK_STALE_THRESHOLD;
+  const acquisitionTimeout =
+    options.acquisitionTimeout ?? DEFAULT_INSTALL_LOCK_ACQUISITION_TIMEOUT;
   const heartbeatInterval =
     options.heartbeatInterval ?? DEFAULT_INSTALL_LOCK_HEARTBEAT_INTERVAL;
   const cleanupOptions = {
@@ -513,7 +512,9 @@ export async function withInstallLock<T>(
   };
   const lockParent = path.dirname(lockPath);
   let loggedContention = false;
-  let recoveredStaleLock = false;
+  let warnedBlockedLock = false;
+  let lastBlockedResult: InstallLockBlockedResult | undefined;
+  let contentionStartedAt: number | undefined;
   await mkdir(lockParent, {recursive: true});
   while (true) {
     try {
@@ -526,6 +527,7 @@ export async function withInstallLock<T>(
       if (!isErrorWithCode(error, 'EEXIST')) {
         throw error;
       }
+      contentionStartedAt ??= performance.now();
       const claimResult = await claimStaleInstallLock(
         lockPath,
         staleThreshold,
@@ -535,17 +537,33 @@ export async function withInstallLock<T>(
         options.beforeStaleLockClaim,
       );
       if (claimResult.status === 'claimed') {
-        recoveredStaleLock = true;
         break;
       }
       if (claimResult.status === 'blocked') {
-        const message = formatInstallLockWarning(lockPath, claimResult);
-        warningLogger(message);
-        throw new InstallLockError(lockPath, claimResult.reason, message);
-      }
-      if (!loggedContention) {
-        warningLogger(formatInstallLockContention(lockPath, staleThreshold));
+        lastBlockedResult = claimResult;
+        if (!warnedBlockedLock) {
+          warningLogger(formatInstallLockWarning(lockPath, claimResult));
+          warnedBlockedLock = true;
+        }
+      } else if (claimResult.status === 'retry' && !loggedContention) {
+        logger?.(`Waiting for browser install lock at ${lockPath}`);
         loggedContention = true;
+      }
+      const waitedMs = performance.now() - contentionStartedAt;
+      if (waitedMs >= acquisitionTimeout) {
+        const snapshot = lastBlockedResult?.snapshot;
+        const lockOwner = snapshot?.fromHeartbeat ? snapshot.owner : undefined;
+        const observedAgeMs =
+          snapshot === undefined
+            ? undefined
+            : Math.max(0, Date.now() - snapshot.mtimeMs);
+        throw new InstallLockError(
+          lockPath,
+          waitedMs,
+          lastBlockedResult?.reason,
+          lockOwner,
+          observedAgeMs,
+        );
       }
       await sleep(retryDelay);
       continue;
@@ -575,7 +593,7 @@ export async function withInstallLock<T>(
   heartbeat.unref();
 
   try {
-    return await task({recoveredStaleLock});
+    return await task();
   } finally {
     clearInterval(heartbeat);
     await heartbeatRefresh;

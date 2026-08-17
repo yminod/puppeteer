@@ -13,8 +13,8 @@ import path from 'node:path';
 import {setTimeout as sleep} from 'node:timers/promises';
 
 import {
+  canUseBirthtime,
   compareInstallLockIdentity,
-  hasUsableInstallLockBirthtime,
   InstallLockError,
   withInstallLock,
 } from '../../lib/installLock.js';
@@ -40,6 +40,7 @@ describe('installLock', function () {
   });
 
   const defaultTestLockOptions = {
+    acquisitionTimeout: 1000,
     heartbeatInterval: 1000,
     retryDelay: 1,
     staleThreshold: 10000,
@@ -72,7 +73,7 @@ describe('installLock', function () {
     fs.rmSync(probePath, {recursive: true});
     const after = fs.statSync(lockPath, {bigint: true});
     if (
-      !hasUsableInstallLockBirthtime(before) ||
+      !canUseBirthtime(before) ||
       compareInstallLockIdentity(before, after) !== 'same'
     ) {
       context.skip();
@@ -91,21 +92,11 @@ describe('installLock', function () {
     return pid;
   }
 
-  it('reports ordinary acquisition without stale-lock recovery', async () => {
-    await withInstallLock(
-      lockPath,
-      async context => {
-        assert.strictEqual(context.recoveredStaleLock, false);
-      },
-      testLockOptions,
-    );
-  });
-
-  it('fails with one warning while a stale lock owner is still alive', async () => {
+  it('waits without claiming while a stale lock owner is still alive', async () => {
     writeStaleOwnerHeartbeat(process.pid);
     let lockEntered = false;
-    const messages: string[] = [];
-    const debugMessages: string[] = [];
+    let warningCount = 0;
+    const warningObserved = Promise.withResolvers<void>();
 
     const lock = withInstallLock(
       lockPath,
@@ -114,12 +105,45 @@ describe('installLock', function () {
       },
       {
         ...testLockOptions,
-        logger: message => {
-          debugMessages.push(String(message));
+        warningLogger: () => {
+          warningCount++;
+          warningObserved.resolve();
         },
-        warningLogger: message => {
-          const text = String(message);
-          messages.push(text);
+      },
+    );
+
+    try {
+      await warningObserved.promise;
+      await sleep(20);
+      assert.strictEqual(lockEntered, false);
+      assert.strictEqual(fs.existsSync(lockPath), true);
+      assert.strictEqual(warningCount, 1);
+    } finally {
+      fs.rmSync(lockPath, {recursive: true, force: true});
+      await lock;
+    }
+
+    assert.strictEqual(lockEntered, true);
+    assert.strictEqual(warningCount, 1);
+    assert.strictEqual(fs.existsSync(lockPath), false);
+    assert.strictEqual(fs.existsSync(lockParent), true);
+  });
+
+  it('times out without claiming a stale lock owned by a live process', async () => {
+    writeStaleOwnerHeartbeat(process.pid);
+    let lockEntered = false;
+    let warningCount = 0;
+
+    const lock = withInstallLock(
+      lockPath,
+      async () => {
+        lockEntered = true;
+      },
+      {
+        ...testLockOptions,
+        acquisitionTimeout: 10,
+        warningLogger: () => {
+          warningCount++;
         },
       },
     );
@@ -128,33 +152,27 @@ describe('installLock', function () {
       assert(error instanceof InstallLockError);
       assert.strictEqual(error.lockPath, lockPath);
       assert.strictEqual(error.reason, 'owner-alive');
-      assert.match(error.message, new RegExp(`process ${process.pid}`));
+      assert.deepStrictEqual(error.owner, {
+        hostname: os.hostname(),
+        pid: process.pid,
+      });
+      assert.ok(error.observedAgeMs! >= 10000);
+      assert.ok(error.waitedMs >= 10);
       return true;
     });
 
     assert.strictEqual(lockEntered, false);
-    const warnings = messages.filter(message => {
-      return message.startsWith('Cannot safely claim');
-    });
-    assert.strictEqual(warnings.length, 1);
-    assert.deepStrictEqual(debugMessages, []);
-    assert.match(warnings[0]!, new RegExp(`process ${process.pid}`));
-    assert.match(warnings[0]!, /was not claimed/);
-    assert.strictEqual(
-      messages.filter(message => {
-        return message.startsWith('Waiting for browser install lock');
-      }).length,
-      0,
-    );
+    assert.strictEqual(warningCount, 1);
     assert.strictEqual(fs.existsSync(lockPath), true);
     assert.strictEqual(fs.existsSync(lockParent), true);
   });
 
-  it('reports contention once without inspecting fresh malformed metadata', async () => {
+  it('logs contention without warning or inspecting fresh malformed metadata', async () => {
     fs.mkdirSync(lockPath, {recursive: true});
     fs.writeFileSync(path.join(lockPath, 'heartbeat'), '{');
     let lockEntered = false;
-    const messages: string[] = [];
+    let debugCount = 0;
+    let warningCount = 0;
     const contentionObserved = Promise.withResolvers<void>();
 
     const lock = withInstallLock(
@@ -164,12 +182,12 @@ describe('installLock', function () {
       },
       {
         ...testLockOptions,
-        warningLogger: message => {
-          const text = String(message);
-          messages.push(text);
-          if (text.startsWith('Waiting for browser install lock')) {
-            contentionObserved.resolve();
-          }
+        logger: () => {
+          debugCount++;
+          contentionObserved.resolve();
+        },
+        warningLogger: () => {
+          warningCount++;
         },
       },
     );
@@ -177,20 +195,8 @@ describe('installLock', function () {
     try {
       await contentionObserved.promise;
       assert.strictEqual(lockEntered, false);
-      assert.strictEqual(
-        messages.some(message => {
-          return message.startsWith('Cannot safely claim');
-        }),
-        false,
-      );
-      assert.strictEqual(
-        messages.filter(message => {
-          return message.startsWith('Waiting for browser install lock');
-        }).length,
-        1,
-      );
-      assert.match(messages[0]!, /Another browser installation may still/);
-      assert.match(messages[0]!, /checks whether stale-lock recovery is safe/);
+      assert.strictEqual(warningCount, 0);
+      assert.strictEqual(debugCount, 1);
     } finally {
       fs.rmSync(lockPath, {recursive: true, force: true});
       await lock;
@@ -199,11 +205,11 @@ describe('installLock', function () {
     assert.strictEqual(lockEntered, true);
   });
 
-  it('fails instead of claiming stale locks owned on another host', async () => {
+  it('times out instead of claiming stale locks owned on another host', async () => {
     const remoteHostname = `${os.hostname()}-remote`;
     writeStaleOwnerHeartbeat(process.pid, remoteHostname);
     let lockEntered = false;
-    const messages: string[] = [];
+    let warningCount = 0;
 
     const lock = withInstallLock(
       lockPath,
@@ -212,9 +218,9 @@ describe('installLock', function () {
       },
       {
         ...testLockOptions,
-        warningLogger: message => {
-          const text = String(message);
-          messages.push(text);
+        acquisitionTimeout: 0,
+        warningLogger: () => {
+          warningCount++;
         },
       },
     );
@@ -222,16 +228,15 @@ describe('installLock', function () {
     await assert.rejects(lock, error => {
       assert(error instanceof InstallLockError);
       assert.strictEqual(error.reason, 'owner-unverifiable');
+      assert.deepStrictEqual(error.owner, {
+        hostname: remoteHostname,
+        pid: process.pid,
+      });
       return true;
     });
 
     assert.strictEqual(lockEntered, false);
-    const warnings = messages.filter(message => {
-      return message.startsWith('Cannot safely claim');
-    });
-    assert.strictEqual(warnings.length, 1);
-    assert.ok(warnings[0]!.includes(remoteHostname));
-    assert.match(warnings[0]!, /could not be checked safely/);
+    assert.strictEqual(warningCount, 1);
     assert.strictEqual(fs.existsSync(lockPath), true);
     assert.strictEqual(fs.existsSync(lockParent), true);
   });
@@ -245,22 +250,29 @@ describe('installLock', function () {
       ]) {
         writeStaleHeartbeat(contents);
         let lockEntered = false;
-        const warnings: string[] = [];
-        console.warn = (...data: unknown[]) => {
-          warnings.push(data.map(String).join(' '));
+        let warningCount = 0;
+        console.warn = () => {
+          warningCount++;
         };
         const lock = withInstallLock(
           lockPath,
           async () => {
             lockEntered = true;
           },
-          defaultTestLockOptions,
+          {
+            ...defaultTestLockOptions,
+            acquisitionTimeout: 0,
+          },
         );
 
-        await assert.rejects(lock, InstallLockError);
+        await assert.rejects(lock, error => {
+          assert(error instanceof InstallLockError);
+          assert.strictEqual(error.reason, 'invalid-owner-metadata');
+          assert.strictEqual(error.owner, undefined);
+          return true;
+        });
         assert.strictEqual(lockEntered, false);
-        assert.strictEqual(warnings.length, 1);
-        assert.match(warnings[0]!, /invalid owner metadata/);
+        assert.strictEqual(warningCount, 1);
         fs.rmSync(lockPath, {recursive: true, force: true});
       }
     } finally {
@@ -268,13 +280,12 @@ describe('installLock', function () {
     }
   });
 
-  it('claims stale locks owned by exited local processes', async () => {
+  it('claims a safely recoverable lock before checking the timeout', async () => {
     const heartbeatPath = writeStaleOwnerHeartbeat(await exitedProcessPid());
 
     await withInstallLock(
       lockPath,
-      async context => {
-        assert.strictEqual(context.recoveredStaleLock, true);
+      async () => {
         assert.deepStrictEqual(
           JSON.parse(fs.readFileSync(heartbeatPath, 'utf8')),
           {
@@ -283,7 +294,7 @@ describe('installLock', function () {
           },
         );
       },
-      testLockOptions,
+      {...testLockOptions, acquisitionTimeout: 0},
     );
 
     assert.strictEqual(fs.existsSync(lockPath), false);
@@ -297,11 +308,8 @@ describe('installLock', function () {
       birthtimeNs: 3n,
     };
 
-    assert.strictEqual(hasUsableInstallLockBirthtime(identity), true);
-    assert.strictEqual(
-      hasUsableInstallLockBirthtime({...identity, birthtimeNs: 0n}),
-      false,
-    );
+    assert.strictEqual(canUseBirthtime(identity), true);
+    assert.strictEqual(canUseBirthtime({...identity, birthtimeNs: 0n}), false);
     assert.strictEqual(compareInstallLockIdentity(identity, identity), 'same');
     assert.strictEqual(
       compareInstallLockIdentity(identity, {...identity, ino: 4n}),
@@ -313,7 +321,7 @@ describe('installLock', function () {
     );
   });
 
-  it('claims stale lock directories without heartbeat files', async function () {
+  it('uses the stale threshold for lock directories without heartbeat files', async function () {
     fs.mkdirSync(lockPath, {recursive: true});
     requireStableDirectoryBirthtime(this);
     const heartbeatPath = path.join(lockPath, 'heartbeat');
@@ -333,7 +341,7 @@ describe('installLock', function () {
     assert.strictEqual(fs.existsSync(lockParent), true);
   });
 
-  it('recovers when stale reaper directories are left behind', async () => {
+  it('uses the stale threshold for reaper directories left behind', async () => {
     const heartbeatPath = writeStaleOwnerHeartbeat(await exitedProcessPid());
     const reaperPath = path.join(lockPath, 'reaper');
     fs.mkdirSync(reaperPath);
