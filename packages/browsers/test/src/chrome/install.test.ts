@@ -11,6 +11,7 @@ import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 
+import {InstallLockError} from '../../../lib/installLock.js';
 import {
   install,
   canDownload,
@@ -125,16 +126,16 @@ describe('Chrome install', () => {
     assert.strictEqual(fs.existsSync(expectedOutputPath), true);
   });
 
-  it('returns install-lock timeout guidance without provider aggregation', async function () {
+  it('preserves install-lock timeout details without starting installation', async function () {
     this.timeout(60000);
     const lockPath = expectedInstallLockPath();
-    writeStaleInstallLock(lockPath, {
+    const owner = {
       hostname: `${os.hostname()}-remote`,
       pid: process.pid,
-    });
-    const messages: string[] = [];
+    };
+    writeStaleInstallLock(lockPath, owner);
 
-    let error: Error | undefined;
+    let error: (Error & {cause?: unknown}) | undefined;
     try {
       await install({
         cacheDir: tmpDir,
@@ -143,30 +144,39 @@ describe('Chrome install', () => {
         buildId: testChromeBuildId,
         installLockTimeout: 0,
         logger: () => {
-          return message => {
-            messages.push(String(message));
-          };
+          return () => {};
         },
       });
     } catch (cause) {
       assert(cause instanceof Error);
-      error = cause;
+      error = cause as Error & {cause?: unknown};
     }
 
     assert(error);
-    assert.match(error.message, /timed out while waiting for its install lock/);
-    assert.ok(error.message.includes(`Cache path: ${tmpDir}`));
-    assert.ok(error.message.includes(`Lock path: ${lockPath}`));
-    assert.match(error.message, /Last blocked reason: owner-unverifiable/);
-    assert.match(error.message, /browser installation task was not started/i);
-    assert.match(error.message, /no browser installation or related helper/);
-    assert.doesNotMatch(error.message, /All providers failed/);
-    assert.strictEqual(
-      messages.filter(message => {
-        return message.startsWith('Cannot safely claim');
-      }).length,
-      1,
-    );
+    const lockError = error.cause;
+    assert(lockError instanceof InstallLockError);
+    assert.strictEqual(lockError.lockPath, lockPath);
+    assert.strictEqual(lockError.reason, 'owner-unverifiable');
+    assert.deepStrictEqual(lockError.owner, owner);
+    assert.ok(lockError.observedAgeMs! >= 5 * 60 * 1000);
+    assert.ok(lockError.waitedMs >= 0);
+
+    for (const detail of [
+      tmpDir,
+      lockPath,
+      lockError.reason,
+      owner.hostname,
+      String(owner.pid),
+    ]) {
+      assert.ok(
+        error.message.includes(detail),
+        `Expected install-lock guidance to include ${detail}`,
+      );
+    }
+    assert.match(error.message, /remove[\s\S]*lock[\s\S]*retry/i);
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(lockPath)), [
+      path.basename(lockPath),
+    ]);
     assert.strictEqual(fs.existsSync(lockPath), true);
   });
 
