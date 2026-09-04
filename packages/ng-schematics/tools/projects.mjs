@@ -129,15 +129,20 @@ class AngularProject {
 
   get commandOptions() {
     return {
-      ...process.env,
       cwd: join(cwd(), `/sandbox/${this.#name}/`),
+      env: {...process.env},
     };
   }
 
-  async runNpmScripts(command, options) {
+  async runNpmScripts(command, options = {}) {
+    const commandOptions = this.commandOptions;
     await this.executeCommand(`npm run ${command}`, {
-      ...this.commandOptions,
-      options,
+      ...commandOptions,
+      ...options,
+      env: {
+        ...commandOptions.env,
+        ...options.env,
+      },
     });
   }
 
@@ -174,8 +179,8 @@ export class AngularProjectSingle extends AngularProject {
       `ng new ${this.name} --directory=sandbox/${this.name} --defaults --skip-git`,
       {
         env: {
-          PUPPETEER_SKIP_DOWNLOAD: 'true',
           ...process.env,
+          PUPPETEER_SKIP_DOWNLOAD: 'true',
         },
       },
     );
@@ -190,25 +195,27 @@ export class AngularProjectMulti extends AngularProject {
       `ng new ${this.name} --create-application=false --directory=sandbox/${this.name} --defaults --skip-git`,
       {
         env: {
-          PUPPETEER_SKIP_DOWNLOAD: 'true',
           ...process.env,
+          PUPPETEER_SKIP_DOWNLOAD: 'true',
         },
       },
     );
 
+    const commandOptions = this.commandOptions;
+    const generateOptions = {
+      ...commandOptions,
+      env: {
+        ...commandOptions.env,
+        PUPPETEER_SKIP_DOWNLOAD: 'true',
+      },
+    };
     await this.executeCommand(
       `ng generate application core --style=css --routing=true`,
-      {
-        PUPPETEER_SKIP_DOWNLOAD: 'true',
-        ...this.commandOptions,
-      },
+      generateOptions,
     );
     await this.executeCommand(
       `ng generate application admin --style=css --routing=false`,
-      {
-        PUPPETEER_SKIP_DOWNLOAD: 'true',
-        ...this.commandOptions,
-      },
+      generateOptions,
     );
   }
 }
