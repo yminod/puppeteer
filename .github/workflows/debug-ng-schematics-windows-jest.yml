@@ -1,0 +1,92 @@
+name: Debug ng-schematics Windows Jest
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Repository to check out
+        required: true
+        default: puppeteer/puppeteer
+        type: string
+      ref:
+        description: Branch, tag, or commit SHA to test
+        required: true
+        default: a908d92d1541d4fbc5506fcd972f8872e38d12de
+        type: string
+      use-cache:
+        description: Restore the npm cache
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  windows-jest:
+    name: Angular Schematics smoke test on Windows Jest
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@3d3c42e5aac5ba805825a76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node.js with npm cache
+        if: ${{ inputs.use-cache }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Set up Node.js without npm cache
+        if: ${{ !inputs.use-cache }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Print environment versions
+        shell: pwsh
+        run: |
+          node --version
+          npm --version
+          npm config get cache
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
+
+      - name: Build all and schematics
+        run: npm run build
+
+      - name: Install browsers
+        run: npm run postinstall
+
+      - name: Run Windows Jest smoke test
+        run: node tools/smoke.mjs -r jest
+        working-directory: ./packages/ng-schematics
+
+      - name: Print npm debug logs
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $npmCache = npm config get cache
+          $logDirectory = Join-Path $npmCache '_logs'
+
+          if (!(Test-Path -LiteralPath $logDirectory)) {
+            Write-Output "npm log directory does not exist: $logDirectory"
+            exit 0
+          }
+
+          Get-ChildItem -LiteralPath $logDirectory -Filter '*-debug-0.log' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 10 |
+            ForEach-Object {
+              Write-Output "::group::$($_.Name)"
+              Get-Content -LiteralPath $_.FullName
+              Write-Output '::endgroup::'
+            }
