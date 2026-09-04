@@ -456,6 +456,19 @@ jobs:
       - name: Run tests
         run: node tools/smoke.mjs -r ${{ matrix.test-runner }}
         working-directory: ./packages/ng-schematics
+      - name: Print npm debug log on Windows failure
+        if: ${{ failure() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $npmCache = npm config get cache
+          Get-ChildItem -LiteralPath (Join-Path $npmCache '_logs') -Filter '*-debug-0.log' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 5 |
+            ForEach-Object {
+              Write-Output "::group::$($_.Name)"
+              Get-Content -LiteralPath $_.FullName
+              Write-Output '::endgroup::'
+            }
 
   ng-schematics-smoke-tests-required:
     name: '[Required] Angular Schematics smoke tests'
