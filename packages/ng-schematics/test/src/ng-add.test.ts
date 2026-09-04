@@ -10,6 +10,7 @@ import expect from 'expect';
 import {
   MULTI_LIBRARY_OPTIONS,
   buildTestingTree,
+  buildTestingTreeWithTasks,
   getAngularJsonScripts,
   getMultiApplicationFile,
   getMultiLibraryFile,
@@ -36,6 +37,20 @@ void describe('@puppeteer/ng-schematics: ng-add', () => {
       expect(configurations).toEqual({
         production: {
           devServerTarget: 'sandbox:serve:production',
+        },
+      });
+    });
+    void it('should install dependencies once', async () => {
+      const {tasks} = await buildTestingTreeWithTasks('ng-add', 'single', {
+        testRunner: 'jest',
+      });
+
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toMatchObject({
+        name: 'node-package',
+        options: {
+          allowScripts: true,
+          command: 'install',
         },
       });
     });

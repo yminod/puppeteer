@@ -90,6 +90,17 @@ export async function buildTestingTree(
   type: 'single' | 'multi' = 'single',
   userOptions?: Record<string, unknown>,
 ): Promise<UnitTestTree> {
+  return (await buildTestingTreeWithTasks(command, type, userOptions)).tree;
+}
+
+export async function buildTestingTreeWithTasks(
+  command: 'ng-add' | 'e2e' | 'config',
+  type: 'single' | 'multi' = 'single',
+  userOptions?: Record<string, unknown>,
+): Promise<{
+  tree: UnitTestTree;
+  tasks: SchematicTestRunner['tasks'];
+}> {
   const runner = new SchematicTestRunner(
     'schematics',
     join(import.meta.dirname, '../../lib/schematics/collection.json'),
@@ -136,7 +147,8 @@ export async function buildTestingTree(
     workingTree = await runner.runSchematic('ng-add', options, workingTree);
   }
 
-  return await runner.runSchematic(command, options, workingTree);
+  const tree = await runner.runSchematic(command, options, workingTree);
+  return {tree, tasks: runner.tasks};
 }
 
 export async function runSchematic(

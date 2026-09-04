@@ -12,7 +12,7 @@ import {
 } from '@angular-devkit/schematics';
 import {NodePackageInstallTask} from '@angular-devkit/schematics/tasks/index.js';
 import {of} from 'rxjs';
-import {concatMap, map, scan} from 'rxjs/operators';
+import {concatMap, map, toArray} from 'rxjs/operators';
 
 import {
   addCommonFiles as addCommonFilesHelper,
@@ -27,7 +27,6 @@ import {
   getDependenciesFromOptions,
   getPackageLatestNpmVersion,
   DependencyType,
-  type NodePackage,
   updateAngularJsonScripts,
 } from '../utils/packages.js';
 import {TestRunner, type SchematicsOptions} from '../utils/types.js';
@@ -57,10 +56,7 @@ function addDependencies(options: SchematicsOptions): Rule {
       concatMap((packageName: string) => {
         return getPackageLatestNpmVersion(packageName);
       }),
-      scan((array, nodePackage) => {
-        array.push(nodePackage);
-        return array;
-      }, [] as NodePackage[]),
+      toArray(),
       map(packages => {
         context.logger.debug('Updating dependencies...');
         addPackageJsonDependencies(tree, packages, DependencyType.Dev);
