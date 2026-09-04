@@ -70,9 +70,8 @@ class AngularProject {
   }
 
   async executeCommand(command, options) {
-    const [executable, ...args] = command.split(' ');
     await new Promise((resolve, reject) => {
-      const createProcess = spawn(executable, args, {
+      const createProcess = spawn(command, {
         shell: true,
         ...options,
       });
@@ -91,16 +90,22 @@ class AngularProject {
       createProcess.stdout.on('data', onData);
       createProcess.stderr.on('data', onData);
 
-      createProcess.on('error', message => {
-        console.error(`Running ${command} exited with error:`, message);
-        reject(message);
+      createProcess.on('error', error => {
+        console.error(`Running ${command} exited with error:`, error);
+        reject(error);
       });
 
-      createProcess.on('exit', code => {
+      createProcess.on('close', (code, signal) => {
         if (code === 0) {
           resolve(true);
         } else {
-          reject();
+          reject(
+            new Error(
+              `Running ${command} failed${
+                signal ? ` with signal ${signal}` : ` with exit code ${code}`
+              }`,
+            ),
+          );
         }
       });
     });
