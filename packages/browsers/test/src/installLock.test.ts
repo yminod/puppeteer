@@ -50,6 +50,119 @@ describe('installLock', function () {
     warningLogger: () => {},
   };
 
+  for (const taskFails of [false, true]) {
+    it(`preserves task ${taskFails ? 'error' : 'result'} when cleanup and logging fail`, async () => {
+      const primary = new Error('task failed');
+      const result = {};
+      let warning = '';
+      const operation = withInstallLock(
+        lockPath,
+        async () => {
+          if (taskFails) {
+            throw primary;
+          }
+          return result;
+        },
+        {
+          ...testLockOptions,
+          filesystem: {
+            rm: async (target, options) => {
+              if (target === lockPath) {
+                throw new Error('injected cleanup failure');
+              }
+              await fs.promises.rm(target, options);
+            },
+          },
+          warningLogger: message => {
+            warning = String(message);
+            throw new Error('logger failed');
+          },
+        },
+      );
+      if (taskFails) {
+        await assert.rejects(operation, error => {
+          return error === primary;
+        });
+      } else {
+        assert.strictEqual(await operation, result);
+      }
+      assert.ok(warning.includes(lockPath));
+      assert.ok(warning.includes('injected cleanup failure'));
+      assert.ok(fs.existsSync(lockPath));
+    });
+  }
+
+  it('preserves initial heartbeat failure when cleanup fails', async () => {
+    const primary = new Error('write failed');
+    await assert.rejects(
+      withInstallLock(
+        lockPath,
+        async () => {
+          assert.fail('must not start task');
+        },
+        {
+          ...testLockOptions,
+          filesystem: {
+            writeFile: async () => {
+              throw primary;
+            },
+            rm: async () => {
+              throw new Error('cleanup failed');
+            },
+          },
+        },
+      ),
+      error => {
+        return error === primary;
+      },
+    );
+  });
+
+  it('publishes complete heartbeat JSON and retains it on refresh rename failure', async () => {
+    const refreshFailed = Promise.withResolvers<void>();
+    let publications = 0;
+    let previous = '';
+    await withInstallLock(
+      lockPath,
+      async () => {
+        await refreshFailed.promise;
+        assert.strictEqual(
+          fs.readFileSync(path.join(lockPath, 'heartbeat'), 'utf8'),
+          previous,
+        );
+      },
+      {
+        ...testLockOptions,
+        heartbeatInterval: 5,
+        filesystem: {
+          rename: async (source, destination) => {
+            const contents = await fs.promises.readFile(source, 'utf8');
+            assert.deepStrictEqual(JSON.parse(contents), {
+              hostname: os.hostname(),
+              pid: process.pid,
+            });
+            publications++;
+            if (publications > 1) {
+              assert.strictEqual(
+                await fs.promises.readFile(destination, 'utf8'),
+                previous,
+              );
+              throw new Error('rename failed');
+            }
+            assert.strictEqual(fs.existsSync(destination), false);
+            await fs.promises.rename(source, destination);
+            previous = contents;
+          },
+        },
+        warningLogger: () => {
+          refreshFailed.resolve();
+        },
+      },
+    );
+    assert.ok(publications >= 2);
+    assert.strictEqual(fs.existsSync(lockPath), false);
+  });
+
   function writeStaleHeartbeat(contents: string): string {
     fs.mkdirSync(lockPath, {recursive: true});
     const heartbeatPath = path.join(lockPath, 'heartbeat');
@@ -65,6 +178,70 @@ describe('installLock', function () {
   ): string {
     return writeStaleHeartbeat(`${JSON.stringify({hostname, pid})}\n`);
   }
+
+  it('keeps a claimed lock usable when reaper cleanup and logging fail', async () => {
+    writeStaleOwnerHeartbeat(await exitedProcessPid());
+    let warned = false;
+    const result = await withInstallLock(
+      lockPath,
+      async () => {
+        assert.ok(warned);
+        return 42;
+      },
+      {
+        ...testLockOptions,
+        filesystem: {
+          rm: async (target, options) => {
+            if (target === path.join(lockPath, 'reaper')) {
+              throw new Error('reaper cleanup failed');
+            }
+            await fs.promises.rm(target, options);
+          },
+        },
+        warningLogger: () => {
+          warned = true;
+          throw new Error('logger failed');
+        },
+      },
+    );
+    assert.strictEqual(result, 42);
+    assert.strictEqual(fs.existsSync(lockPath), false);
+  });
+
+  it('retains the primary claim error when reaper cleanup fails', async () => {
+    writeStaleOwnerHeartbeat(await exitedProcessPid());
+    const previous = fs.readFileSync(path.join(lockPath, 'heartbeat'), 'utf8');
+    const primary = new Error('heartbeat publish failed');
+    await assert.rejects(
+      withInstallLock(
+        lockPath,
+        async () => {
+          assert.fail('must not enter task');
+        },
+        {
+          ...testLockOptions,
+          filesystem: {
+            rename: async () => {
+              throw primary;
+            },
+            rm: async (target, options) => {
+              if (target === path.join(lockPath, 'reaper')) {
+                throw new Error('reaper cleanup failed');
+              }
+              await fs.promises.rm(target, options);
+            },
+          },
+        },
+      ),
+      error => {
+        return error === primary;
+      },
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(lockPath, 'heartbeat'), 'utf8'),
+      previous,
+    );
+  });
 
   function requireStableDirectoryBirthtime(context: Mocha.Context): void {
     const before = fs.statSync(lockPath, {bigint: true});

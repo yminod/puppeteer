@@ -7,9 +7,10 @@
 import assert from 'node:assert';
 import {spawnSync} from 'node:child_process';
 import {existsSync, readFileSync} from 'node:fs';
-import {mkdir, rm, unlink} from 'node:fs/promises';
+import {mkdir, mkdtemp, rename, rm, stat, unlink} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {setTimeout as sleep} from 'node:timers/promises';
 
 import {
   Browser,
@@ -83,6 +84,14 @@ function debugTimeEnd(label: string, logger?: Logger) {
  * @public
  */
 export interface InstallOptions {
+  /** @internal Temporary experiment controls; not a proposed public API. */
+  experimentForTesting?: {
+    staging?: boolean;
+    lockOptions?: Parameters<typeof withInstallLock>[2];
+    unpack?: typeof unpackArchive;
+    afterExtract?: (output: string) => Promise<void>;
+    beforeReturn?: () => Promise<void>;
+  };
   /**
    * Determines the path to download browsers to.
    */
@@ -459,11 +468,20 @@ async function installUrl(
   );
   const installLogger = logger?.(DEBUG_PREFIXES.install);
   const withBrowserInstallLock = <T>(task: () => Promise<T>): Promise<T> => {
-    return withInstallLock(lockPath, task, {
-      acquisitionTimeout: options.installLockTimeout,
-      logger: installLogger,
-      warningLogger: installLogger,
-    });
+    return withInstallLock(
+      lockPath,
+      async () => {
+        const result = await task();
+        await options.experimentForTesting?.beforeReturn?.();
+        return result;
+      },
+      {
+        acquisitionTimeout: options.installLockTimeout,
+        logger: installLogger,
+        warningLogger: installLogger,
+        ...options.experimentForTesting?.lockOptions,
+      },
+    );
   };
   if (!existsSync(browserRoot)) {
     await mkdir(browserRoot, {recursive: true});
@@ -516,6 +534,92 @@ async function installUrl(
   );
 
   return await withBrowserInstallLock(async () => {
+    if (options.experimentForTesting?.staging) {
+      // Deliberately narrow: only a default-provider unpacked artifact, no shared
+      // alias/provider metadata or system dependency writes in this experiment.
+      assert(provider instanceof DefaultProvider);
+      assert(!options.buildIdAlias && !options.installDeps);
+      const validate = async (tree: string): Promise<void> => {
+        const executable = path.resolve(tree, relativeExecutablePath);
+        assert(executable.startsWith(path.resolve(tree) + path.sep));
+        assert((await stat(executable)).isFile());
+      };
+      const installed = new InstalledBrowser(
+        cache,
+        options.browser,
+        options.buildId,
+        platform,
+      );
+      if (existsSync(outputPath)) {
+        await validate(outputPath);
+        await runSetup(installed, logger);
+        return installed;
+      }
+      const stagingRoot = path.join(browserRoot, '.staging');
+      await mkdir(stagingRoot, {recursive: true});
+      const attempt = await mkdtemp(path.join(stagingRoot, 'attempt-'));
+      const archive = path.join(attempt, fileName);
+      const output = path.join(attempt, 'output');
+      try {
+        await downloadFile(
+          url,
+          archive,
+          downloadProgressCallback,
+          options.expectedHash,
+        );
+        await (options.experimentForTesting.unpack ?? unpackArchive)(
+          archive,
+          output,
+          logger,
+        );
+        await options.experimentForTesting.afterExtract?.(output);
+        await validate(output);
+        for (let retry = 0; ; retry++) {
+          if (existsSync(outputPath)) {
+            await validate(outputPath);
+            break;
+          }
+          try {
+            await rename(output, outputPath);
+            break;
+          } catch (error) {
+            if (existsSync(outputPath)) {
+              await validate(outputPath);
+              break;
+            }
+            const code = (error as NodeJS.ErrnoException).code;
+            if (
+              process.platform !== 'win32' ||
+              !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') ||
+              retry >= 4
+            ) {
+              throw error;
+            }
+            await sleep(20);
+          }
+        }
+        await runSetup(installed, logger);
+        return installed;
+      } finally {
+        // Never infer that another attempt is abandoned merely from lock expiry.
+        try {
+          await rm(attempt, {
+            recursive: true,
+            force: true,
+            maxRetries: 5,
+            retryDelay: 100,
+          });
+        } catch (error) {
+          try {
+            installLogger?.(
+              `Failed to clean experiment staging ${attempt}: ${error}`,
+            );
+          } catch {
+            /* Preserve outcome. */
+          }
+        }
+      }
+    }
     // Write metadata for the installation (only for non-default providers)
     if (!(provider instanceof DefaultProvider)) {
       cache.writeExecutablePath(
@@ -573,7 +677,12 @@ async function installUrl(
       );
       try {
         debugTime('extract');
-        await unpackArchive(archivePath, outputPath, options.logger);
+        await (options.experimentForTesting?.unpack ?? unpackArchive)(
+          archivePath,
+          outputPath,
+          options.logger,
+        );
+        await options.experimentForTesting?.afterExtract?.(outputPath);
       } finally {
         debugTimeEnd('extract', logger);
       }

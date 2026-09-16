@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {randomUUID} from 'node:crypto';
 import type {Stats} from 'node:fs';
-import {mkdir, readFile, rm, stat, writeFile} from 'node:fs/promises';
+import {mkdir, readFile, rename, rm, stat, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {setTimeout as sleep} from 'node:timers/promises';
@@ -24,6 +25,13 @@ const DEFAULT_INSTALL_LOCK_CLEANUP_MAX_RETRIES = 5;
 const DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY = 100;
 
 interface InstallLockOptions {
+  /** @internal Experimental, unsafe without isolated install writes. */
+  recoveryForTesting?: {
+    hardStaleThreshold?: number;
+    immediateDeadOwner?: boolean;
+  };
+  /** @internal Filesystem failure injection for lock tests. */
+  filesystem?: Partial<InstallLockFilesystem>;
   retryDelay?: number;
   /** Maximum observed lock-state age before stale recovery is considered. */
   staleThreshold?: number;
@@ -88,6 +96,36 @@ type InstallLockClaimResult =
 interface InstallLockCleanupOptions {
   maxRetries: number;
   retryDelay: number;
+  filesystem: InstallLockFilesystem;
+  warningLogger: LoggerFunction;
+}
+
+interface InstallLockFilesystem {
+  writeFile: typeof writeFile;
+  rename: typeof rename;
+  rm: typeof rm;
+}
+
+function warnCleanup(logger: LoggerFunction, message: string): void {
+  try {
+    logger(message);
+  } catch {
+    // Diagnostics must not replace the operation's outcome.
+  }
+}
+
+async function cleanupInstallLockPath(
+  targetPath: string,
+  options: InstallLockCleanupOptions,
+): Promise<void> {
+  try {
+    await removeInstallLockPath(targetPath, options);
+  } catch (error) {
+    warnCleanup(
+      options.warningLogger,
+      `Failed to remove ${targetPath}: ${error}`,
+    );
+  }
 }
 
 /**
@@ -178,7 +216,7 @@ async function removeInstallLockPath(
   // Recursive rm() retries ENOTEMPTY against the same path, so it may remove a
   // replacement lock created during cleanup. Keep retries bounded; identity
   // checks cannot make deletion atomic.
-  await rm(targetPath, {
+  await options.filesystem.rm(targetPath, {
     recursive: true,
     force: true,
     maxRetries: options.maxRetries,
@@ -276,7 +314,29 @@ function getInstallLockClaimDecision(
   snapshot: InstallLockSnapshot,
   staleThreshold: number,
   localHostname: string,
+  recovery?: InstallLockOptions['recoveryForTesting'],
 ): InstallLockClaimDecision {
+  const age = Date.now() - snapshot.mtimeMs;
+  if (
+    snapshot.fromHeartbeat &&
+    recovery?.hardStaleThreshold !== undefined &&
+    age > recovery.hardStaleThreshold
+  ) {
+    return {status: 'claimable'};
+  }
+  if (
+    snapshot.fromHeartbeat &&
+    recovery?.immediateDeadOwner &&
+    snapshot.owner?.hostname === localHostname
+  ) {
+    try {
+      process.kill(snapshot.owner.pid, 0);
+    } catch (error) {
+      if (isErrorWithCode(error, 'ESRCH')) {
+        return {status: 'claimable'};
+      }
+    }
+  }
   if (Date.now() - snapshot.mtimeMs <= staleThreshold) {
     return {status: 'retry'};
   }
@@ -373,10 +433,17 @@ async function claimStaleInstallLock(
   cleanupOptions: InstallLockCleanupOptions,
   logger?: LoggerFunction,
   beforeStaleLockClaim?: () => Promise<void>,
+  recovery?: InstallLockOptions['recoveryForTesting'],
 ): Promise<InstallLockClaimResult> {
   const reaperPath = path.join(lockPath, 'reaper');
+  const inspectionThreshold = recovery?.immediateDeadOwner
+    ? -Infinity
+    : staleThreshold;
   try {
-    const initialSnapshot = await inspectInstallLock(lockPath, staleThreshold);
+    const initialSnapshot = await inspectInstallLock(
+      lockPath,
+      inspectionThreshold,
+    );
     if (initialSnapshot === undefined) {
       return {status: 'retry'};
     }
@@ -384,6 +451,7 @@ async function claimStaleInstallLock(
       initialSnapshot,
       staleThreshold,
       owner.hostname,
+      recovery,
     );
     if (initialClaimDecision.status !== 'claimable') {
       return initialClaimDecision;
@@ -405,12 +473,11 @@ async function claimStaleInstallLock(
       }
       throw error;
     }
-    let claimed = false;
     try {
       if (initialSnapshot.fromHeartbeat) {
         const currentSnapshot = await inspectInstallLock(
           lockPath,
-          staleThreshold,
+          inspectionThreshold,
         );
         if (currentSnapshot === undefined) {
           return {status: 'retry'};
@@ -419,6 +486,7 @@ async function claimStaleInstallLock(
           currentSnapshot,
           staleThreshold,
           owner.hostname,
+          recovery,
         );
         if (currentClaimDecision.status !== 'claimable') {
           return currentClaimDecision;
@@ -454,18 +522,10 @@ async function claimStaleInstallLock(
           return currentClaimDecision;
         }
       }
-      await refreshInstallLock(lockPath, owner);
-      claimed = true;
+      await refreshInstallLock(lockPath, owner, cleanupOptions);
       return {status: 'claimed'};
     } finally {
-      try {
-        await removeInstallLockPath(reaperPath, cleanupOptions);
-      } catch (error) {
-        if (!claimed) {
-          throw error;
-        }
-        logger?.(`Failed to remove browser install lock reaper: ${error}`);
-      }
+      await cleanupInstallLockPath(reaperPath, cleanupOptions);
     }
   } catch (error) {
     if (isErrorWithCode(error, 'ENOENT')) {
@@ -478,11 +538,29 @@ async function claimStaleInstallLock(
 async function refreshInstallLock(
   lockPath: string,
   owner: InstallLockOwner,
+  options: InstallLockCleanupOptions,
 ): Promise<void> {
-  await writeFile(
-    path.join(lockPath, 'heartbeat'),
-    `${JSON.stringify(owner)}\n`,
-  );
+  const temporaryPath = path.join(lockPath, `heartbeat-${randomUUID()}.tmp`);
+  try {
+    await options.filesystem.writeFile(
+      temporaryPath,
+      `${JSON.stringify(owner)}\n`,
+      {flag: 'wx'},
+    );
+    await options.filesystem.rename(
+      temporaryPath,
+      path.join(lockPath, 'heartbeat'),
+    );
+  } finally {
+    try {
+      await options.filesystem.rm(temporaryPath, {force: true});
+    } catch (error) {
+      warnCleanup(
+        options.warningLogger,
+        `Failed to remove ${temporaryPath}: ${error}`,
+      );
+    }
+  }
 }
 
 export async function withInstallLock<T>(
@@ -497,14 +575,16 @@ export async function withInstallLock<T>(
     options.acquisitionTimeout ?? DEFAULT_INSTALL_LOCK_ACQUISITION_TIMEOUT;
   const heartbeatInterval =
     options.heartbeatInterval ?? DEFAULT_INSTALL_LOCK_HEARTBEAT_INTERVAL;
+  const logger = options.logger ?? debugInstall;
+  const warningLogger = options.warningLogger ?? console.warn;
   const cleanupOptions = {
+    filesystem: {writeFile, rename, rm, ...options.filesystem},
+    warningLogger,
     maxRetries:
       options.cleanupMaxRetries ?? DEFAULT_INSTALL_LOCK_CLEANUP_MAX_RETRIES,
     retryDelay:
       options.cleanupRetryDelay ?? DEFAULT_INSTALL_LOCK_CLEANUP_RETRY_DELAY,
   };
-  const logger = options.logger ?? debugInstall;
-  const warningLogger = options.warningLogger ?? console.warn;
   const owner = {
     hostname: os.hostname(),
     pid: process.pid,
@@ -534,6 +614,7 @@ export async function withInstallLock<T>(
         cleanupOptions,
         logger,
         options.beforeStaleLockClaim,
+        options.recoveryForTesting,
       );
       if (claimResult.status === 'claimed') {
         break;
@@ -568,9 +649,9 @@ export async function withInstallLock<T>(
       continue;
     }
     try {
-      await refreshInstallLock(lockPath, owner);
+      await refreshInstallLock(lockPath, owner, cleanupOptions);
     } catch (error) {
-      await removeInstallLockPath(lockPath, cleanupOptions);
+      await cleanupInstallLockPath(lockPath, cleanupOptions);
       throw error;
     }
     break;
@@ -581,9 +662,12 @@ export async function withInstallLock<T>(
     if (heartbeatRefresh !== undefined) {
       return;
     }
-    heartbeatRefresh = refreshInstallLock(lockPath, owner)
+    heartbeatRefresh = refreshInstallLock(lockPath, owner, cleanupOptions)
       .catch(error => {
-        logger?.(`Failed to refresh browser install lock: ${error}`);
+        warnCleanup(
+          warningLogger,
+          `Failed to refresh browser install lock at ${lockPath}: ${error}`,
+        );
       })
       .finally(() => {
         heartbeatRefresh = undefined;
@@ -596,6 +680,6 @@ export async function withInstallLock<T>(
   } finally {
     clearInterval(heartbeat);
     await heartbeatRefresh;
-    await removeInstallLockPath(lockPath, cleanupOptions);
+    await cleanupInstallLockPath(lockPath, cleanupOptions);
   }
 }
