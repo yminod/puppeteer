@@ -135,6 +135,16 @@ describe('fileUtil', function () {
       assertTestZipUnpacked();
     });
 
+    it('resolves after closing the archive', async () => {
+      const archivePath = path.join(tmpDir, 'archive.zip');
+      const renamedPath = path.join(tmpDir, 'closed.zip');
+      const outputPath = path.join(tmpDir, 'output');
+      fs.copyFileSync(path.join(fixturesPath, 'test.zip'), archivePath);
+
+      await extractZipWithYauzl(archivePath, outputPath);
+      fs.renameSync(archivePath, renamedPath);
+    });
+
     // Node.js does not honor POSIX permission bits on Windows.
     (os.platform() === 'win32' ? it.skip : it)(
       'preserves owner permissions',
@@ -159,12 +169,15 @@ describe('fileUtil', function () {
     // The target is validated before any symlink is created, so unlike the
     // preceding symlink test the rejection can be checked on Windows too.
     it('rejects symlinks that point outside the target directory', async () => {
+      const archivePath = path.join(tmpDir, 'escape.zip');
+      const renamedPath = path.join(tmpDir, 'closed-escape.zip');
+      fs.copyFileSync(
+        path.join(fixturesPath, 'test-symlink-escape.zip'),
+        archivePath,
+      );
       await assert.rejects(
         () => {
-          return extractZipWithYauzl(
-            path.join(fixturesPath, 'test-symlink-escape.zip'),
-            tmpDir,
-          );
+          return extractZipWithYauzl(archivePath, tmpDir);
         },
         (error: unknown) => {
           const {cause} = error as {cause?: Error};
@@ -176,7 +189,25 @@ describe('fileUtil', function () {
         !fs.existsSync(path.join(tmpDir, 'browser', 'evil-link')),
         'symlink pointing outside the target directory was created',
       );
+      fs.renameSync(archivePath, renamedPath);
     });
+  });
+
+  it('rejects a non-zero decompressor after closing the archive', async () => {
+    const archivePath = path.join(tmpDir, 'input.tar.xz');
+    const renamedPath = path.join(tmpDir, 'closed.tar.xz');
+    const outputPath = path.join(tmpDir, 'output');
+    fs.copyFileSync(path.join(fixturesPath, 'test.tar.xz'), archivePath);
+    internalConstantsForTesting.xz = process.execPath;
+    try {
+      await assert.rejects(
+        unpackArchive(archivePath, outputPath),
+        /`xz` exited with code/,
+      );
+      fs.renameSync(archivePath, renamedPath);
+    } finally {
+      internalConstantsForTesting.xz = 'xz';
+    }
   });
 
   it('throws an error if xz is not found', async () => {

@@ -252,23 +252,15 @@ describe('Install with providers', () => {
     it('should persist executable path in metadata for custom providers', async function () {
       this.timeout(60000);
 
-      // Use the test.tar.bz2 fixture as a mock download
-      const fixturePath = path.join(
-        import.meta.dirname,
-        '..',
-        'fixtures',
-        'test.tar.bz2',
-      );
-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
-
-      // Copy the fixture to simulate a download
-      fs.copyFileSync(fixturePath, archivePath);
-
-      // Create a custom provider that uses the test fixture
+      // Use the test server archive through a custom provider. The redundant
+      // path component keeps the executable valid while making it distinct
+      // from the default provider's spelling.
       const customProvider = new MockProvider({
         supports: true,
-        getDownloadUrlResult: new URL('file://' + archivePath),
-        getExecutablePath: 'chrome-linux/chrome',
+        getDownloadUrlResult: new URL(
+          `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
+        ),
+        getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
       });
 
       // Install using custom provider
@@ -308,26 +300,16 @@ describe('Install with providers', () => {
       );
     });
 
-    it('should not write metadata for default provider installations', async function () {
+    it('should remove a stale custom path after a default provider installation', async function () {
       this.timeout(60000);
 
-      // Use the test.tar.bz2 fixture as a mock download
-      const fixturePath = path.join(
-        import.meta.dirname,
-        '..',
-        'fixtures',
-        'test.tar.bz2',
-      );
-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
-
-      // Copy the fixture to simulate a download
-      fs.copyFileSync(fixturePath, archivePath);
-
-      // Create a custom provider that uses the test fixture
+      // Create a successful custom provider with a valid, non-default path.
       const customProvider = new MockProvider({
         supports: true,
-        getDownloadUrlResult: new URL('file://' + archivePath),
-        getExecutablePath: 'chrome-linux/chrome',
+        getDownloadUrlResult: new URL(
+          `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
+        ),
+        getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
       });
 
       // Install using custom provider first
@@ -356,9 +338,6 @@ describe('Install with providers', () => {
       );
       fs.rmSync(installDir, {recursive: true, force: true});
 
-      // Re-copy the fixture for the default provider install
-      fs.copyFileSync(fixturePath, archivePath);
-
       // Install using default provider
       await install({
         cacheDir: tmpDir,
@@ -369,16 +348,13 @@ describe('Install with providers', () => {
         // No providers option = uses default provider
       });
 
-      // Read the metadata - it should still only have the original entry
-      // The default provider should not have added/modified executablePaths
+      // The completed default-layout install reconciles the stale custom path.
       const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
       const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
-
-      // The metadata file exists but default provider doesn't write executablePaths
-      // The original entry from custom provider should still be there
-      assert.ok(
+      assert.strictEqual(
         metadata.executablePaths?.[key],
-        'Executable path should still be in metadata from custom provider',
+        undefined,
+        'The stale custom executable path should be removed',
       );
     });
 
@@ -447,12 +423,18 @@ describe('Install with providers', () => {
       ];
 
       for (const platform of platforms) {
+        const provider = new MockProvider({
+          getDownloadUrlResult: new URL(
+            `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
+          ),
+          getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
+        });
         const result = await install({
           cacheDir: tmpDir,
           browser: Browser.CHROME,
           platform,
           buildId: testChromeBuildId,
-          providers: [], // Use default provider
+          providers: [provider],
           baseUrl: getServerUrl(),
         });
 

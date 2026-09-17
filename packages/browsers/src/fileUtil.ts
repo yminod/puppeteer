@@ -4,13 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {ChildProcessByStdio} from 'node:child_process';
 import {spawnSync, spawn, execFile} from 'node:child_process';
 import {constants, createReadStream, createWriteStream} from 'node:fs';
 import {mkdir, readdir, symlink} from 'node:fs/promises';
 import * as path from 'node:path';
-import type {Readable, Transform} from 'node:stream';
-import {Stream, Writable} from 'node:stream';
+import {Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {promisify} from 'node:util';
 
@@ -58,52 +56,6 @@ export async function unpackArchive(
   }
 }
 
-function createTransformStream(
-  child: ChildProcessByStdio<Writable, Readable, null>,
-): Transform {
-  const stream = new Stream.Transform({
-    transform(chunk, encoding, callback) {
-      if (!child.stdin.write(chunk, encoding)) {
-        child.stdin.once('drain', callback);
-      } else {
-        callback();
-      }
-    },
-
-    flush(callback) {
-      if (child.stdout.destroyed) {
-        callback();
-      } else {
-        child.stdin.end();
-        child.stdout.on('close', callback);
-      }
-    },
-  });
-
-  child.stdin.on('error', e => {
-    if ('code' in e && e.code === 'EPIPE') {
-      // finished before reading the file finished (i.e. head)
-      stream.emit('end');
-    } else {
-      stream.destroy(e);
-    }
-  });
-
-  child.stdout
-    .on('data', data => {
-      return stream.push(data);
-    })
-    .on('error', e => {
-      return stream.destroy(e);
-    });
-
-  child.once('close', () => {
-    return stream.end();
-  });
-
-  return stream;
-}
-
 /**
  * @internal
  */
@@ -122,39 +74,105 @@ async function extractTar(
   logger?: Logger,
 ): Promise<void> {
   const {unpackTar} = await import('modern-tar/fs');
-  return await new Promise<void>((fulfill, reject) => {
-    function handleError(utilityName: string) {
-      return (error: Error) => {
-        if ('code' in error && error.code === 'ENOENT') {
-          error = new Error(
-            `\`${utilityName}\` utility is required to unpack this archive`,
-            {
-              cause: error,
-            },
-          );
-        }
-        reject(error);
-      };
-    }
-    const unpack = spawn(
-      internalConstantsForTesting[decompressUtilityName],
-      ['-d'],
-      {
-        stdio: ['pipe', 'pipe', 'inherit'],
-      },
-    )
-      .once('error', handleError(decompressUtilityName))
-      .once('exit', code => {
-        logger?.(DEBUG_PREFIXES.fileUtil)?.(
-          `${decompressUtilityName} exited, code=${code}`,
-        );
-      });
+  const unpack = spawn(
+    internalConstantsForTesting[decompressUtilityName],
+    ['-d'],
+    {
+      stdio: ['pipe', 'pipe', 'inherit'],
+    },
+  );
+  const source = createReadStream(tarPath);
+  const tar = unpackTar(folderPath);
+  let firstError: Error | undefined;
+  let spawnError: Error | undefined;
 
-    const tar = unpackTar(folderPath);
-    tar.once('error', handleError('tar'));
-    tar.once('finish', fulfill);
-    createReadStream(tarPath).pipe(createTransformStream(unpack)).pipe(tar);
+  const stopProducer = (error: Error): void => {
+    firstError ??= error;
+    source.destroy();
+    unpack.stdin.destroy();
+    unpack.stdout.destroy();
+    tar.destroy();
+    if (
+      unpack.pid !== undefined &&
+      unpack.exitCode === null &&
+      unpack.signalCode === null
+    ) {
+      try {
+        unpack.kill();
+      } catch {
+        // The close event remains the process-quiescence boundary.
+      }
+    }
+  };
+
+  const childClosed = new Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>(resolve => {
+    unpack.once('error', error => {
+      spawnError = normalizeUtilityError(error, decompressUtilityName);
+      stopProducer(spawnError);
+    });
+    unpack.once('close', (code, signal) => {
+      logger?.(DEBUG_PREFIXES.fileUtil)?.(
+        `${decompressUtilityName} exited, code=${code}, signal=${signal}`,
+      );
+      resolve({code, signal});
+    });
   });
+
+  const input = pipeline(source, unpack.stdin).catch(error => {
+    stopProducer(error as Error);
+    throw error;
+  });
+  const output = pipeline(unpack.stdout, tar).catch(error => {
+    stopProducer(error as Error);
+    throw error;
+  });
+  const [inputResult, outputResult, childResult] = await Promise.allSettled([
+    input,
+    output,
+    childClosed,
+  ]);
+
+  if (spawnError) {
+    throw spawnError;
+  }
+  if (childResult.status === 'rejected') {
+    throw childResult.reason;
+  }
+  if (childResult.value.code !== null && childResult.value.code !== 0) {
+    throw new Error(
+      `\`${decompressUtilityName}\` exited with ` +
+        `code ${childResult.value.code}`,
+    );
+  }
+  if (firstError) {
+    throw firstError;
+  }
+  if (inputResult.status === 'rejected') {
+    throw inputResult.reason;
+  }
+  if (outputResult.status === 'rejected') {
+    throw outputResult.reason;
+  }
+  if (childResult.value.signal) {
+    throw new Error(
+      `\`${decompressUtilityName}\` exited with signal ${childResult.value.signal}`,
+    );
+  }
+}
+
+function normalizeUtilityError(error: Error, utilityName: string): Error {
+  if ('code' in error && error.code === 'ENOENT') {
+    return new Error(
+      `\`${utilityName}\` utility is required to unpack this archive`,
+      {
+        cause: error,
+      },
+    );
+  }
+  return error;
 }
 
 /**
@@ -236,14 +254,58 @@ export async function extractZipWithYauzl(
   const open = promisify<string, Options, ZipFile>(yauzl.open);
   try {
     const zipFile = await open(archivePath, {lazyEntries: true});
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
+      let activeEntry: Promise<void> | undefined;
+      let closed = false;
+      let ended = false;
+      let failure: unknown;
+      let settled = false;
+
+      const settle = (): void => {
+        if (settled || !closed || activeEntry) {
+          return;
+        }
+        if (failure) {
+          settled = true;
+          reject(failure);
+        } else if (ended) {
+          settled = true;
+          resolve();
+        }
+      };
+      const fail = (error: unknown): void => {
+        failure ??= error;
+        zipFile.close();
+        settle();
+      };
+
       zipFile
-        .on('error', reject)
-        .on('end', resolve)
+        .on('error', fail)
+        .on('close', () => {
+          closed = true;
+          settle();
+        })
+        .on('end', () => {
+          ended = true;
+          zipFile.close();
+          settle();
+        })
         .on('entry', entry => {
-          extractZipEntry(zipFile, entry, folderPath).then(() => {
-            zipFile.readEntry();
-          }, reject);
+          activeEntry = extractZipEntry(zipFile, entry, folderPath);
+          void activeEntry.then(
+            () => {
+              activeEntry = undefined;
+              if (failure) {
+                settle();
+              } else {
+                zipFile.readEntry();
+              }
+            },
+            error => {
+              activeEntry = undefined;
+              fail(error);
+            },
+          );
         })
         .readEntry();
     });

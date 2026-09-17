@@ -23,7 +23,15 @@ describe('downloadFile', function () {
 
   beforeEach(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-httputil-test'));
-    server = http.createServer((_req, res) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/aborted') {
+        res.writeHead(200, {'Content-Length': String(testContent.length * 2)});
+        res.write(testContent.subarray(0, 4));
+        setImmediate(() => {
+          res.destroy();
+        });
+        return;
+      }
       res.writeHead(200, {'Content-Length': String(testContent.length)});
       res.end(testContent);
     });
@@ -110,5 +118,19 @@ describe('downloadFile', function () {
       correctHash.toUpperCase(),
     );
     assert.ok(fs.existsSync(destPath));
+  });
+
+  it('rejects an interrupted response after closing the destination', async () => {
+    const destPath = path.join(tmpDir, 'download.bin');
+    const interruptedUrl = new URL('/aborted', serverUrl);
+
+    await assert.rejects(() => {
+      return downloadFile(interruptedUrl, destPath);
+    });
+
+    assert.strictEqual(fs.existsSync(destPath), true);
+    const movedPath = path.join(tmpDir, 'closed-download.bin');
+    fs.renameSync(destPath, movedPath);
+    fs.rmSync(movedPath);
   });
 });

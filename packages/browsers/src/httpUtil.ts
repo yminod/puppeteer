@@ -8,6 +8,8 @@ import {createHash} from 'node:crypto';
 import {createWriteStream, unlinkSync} from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
+import {Transform} from 'node:stream';
+import {finished, pipeline} from 'node:stream/promises';
 import {URL, urlToHttpOptions} from 'node:url';
 
 export async function headHttpRequest(url: URL): Promise<boolean> {
@@ -38,6 +40,7 @@ export async function httpRequest(
   method: string,
   response: (x: http.IncomingMessage) => void,
   keepAlive = true,
+  onError?: (error: Error) => void,
 ): Promise<http.ClientRequest> {
   let agent: http.Agent | undefined;
   try {
@@ -65,7 +68,15 @@ export async function httpRequest(
       res.statusCode < 400 &&
       res.headers.location
     ) {
-      void httpRequest(new URL(res.headers.location), method, response);
+      void httpRequest(
+        new URL(res.headers.location),
+        method,
+        response,
+        keepAlive,
+        onError,
+      ).catch(error => {
+        onError?.(error);
+      });
       // consume response data to free up memory
       // And prevents the connection from being kept alive
       res.resume();
@@ -77,6 +88,9 @@ export async function httpRequest(
     options.protocol === 'https:'
       ? https.request(options, requestCallback)
       : http.request(options, requestCallback);
+  if (onError) {
+    request.once('error', onError);
+  }
   request.end();
   return request;
 }
@@ -107,60 +121,46 @@ class HashVerifier {
 /**
  * @internal
  */
-export function downloadFile(
+export async function downloadFile(
   url: URL,
   destinationPath: string,
   progressCallback?: (downloadedBytes: number, totalBytes: number) => void,
   expectedHash?: string,
 ): Promise<void> {
-  return new Promise<void>(async (resolve, reject) => {
-    let downloadedBytes = 0;
-    let totalBytes = 0;
-    const verifier = expectedHash ? new HashVerifier() : null;
+  const response = await new Promise<http.IncomingMessage>(
+    (resolve, reject) => {
+      void httpRequest(url, 'GET', resolve, true, reject).catch(reject);
+    },
+  );
 
-    try {
-      const request = await httpRequest(url, 'GET', response => {
-        if (response.statusCode !== 200) {
-          const error = new Error(
-            `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
-          );
-          // consume response data to free up memory
-          response.resume();
-          reject(error);
-          return;
-        }
-        const file = createWriteStream(destinationPath);
-        file.on('close', () => {
-          if (verifier && expectedHash) {
-            try {
-              verifier.verify(url, destinationPath, expectedHash);
-            } catch (err) {
-              reject(err);
-              return;
-            }
-          }
-          return resolve();
-        });
-        file.on('error', error => {
-          return reject(error);
-        });
-        totalBytes = parseInt(response.headers['content-length']!, 10);
-        response.on('data', (chunk: Buffer) => {
-          downloadedBytes += chunk.length;
-          verifier?.update(chunk);
-          if (progressCallback) {
-            progressCallback(downloadedBytes, totalBytes);
-          }
-        });
-        response.pipe(file);
-      });
-      request.on('error', error => {
-        return reject(error);
-      });
-    } catch (error) {
-      reject(error);
-    }
+  if (response.statusCode !== 200) {
+    const responseClosed = finished(response).catch(() => {});
+    response.destroy();
+    await responseClosed;
+    throw new Error(
+      `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
+    );
+  }
+
+  let downloadedBytes = 0;
+  const totalBytes = Number.parseInt(
+    response.headers['content-length'] ?? '0',
+    10,
+  );
+  const verifier = expectedHash ? new HashVerifier() : null;
+  const progress = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      downloadedBytes += chunk.length;
+      verifier?.update(chunk);
+      progressCallback?.(downloadedBytes, totalBytes);
+      callback(null, chunk);
+    },
   });
+
+  await pipeline(response, progress, createWriteStream(destinationPath));
+  if (verifier && expectedHash) {
+    verifier.verify(url, destinationPath, expectedHash);
+  }
 }
 
 export async function getJSON(url: URL): Promise<unknown> {

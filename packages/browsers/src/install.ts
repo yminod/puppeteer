@@ -7,7 +7,7 @@
 import assert from 'node:assert';
 import {spawnSync} from 'node:child_process';
 import {existsSync, readFileSync} from 'node:fs';
-import {mkdir, unlink} from 'node:fs/promises';
+import {mkdir} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -15,6 +15,7 @@ import {
   Browser,
   BrowserPlatform,
   downloadUrls,
+  executablePathByBrowser,
 } from './browser-data/browser-data.js';
 import {Cache, InstalledBrowser} from './Cache.js';
 import {debug, DEBUG_PREFIXES, type Logger} from './debug.js';
@@ -22,6 +23,19 @@ import {DefaultProvider} from './DefaultProvider.js';
 import {detectBrowserPlatform} from './detectPlatform.js';
 import {unpackArchive} from './fileUtil.js';
 import {downloadFile, headHttpRequest} from './httpUtil.js';
+import {
+  InvalidInstallMarkerError,
+  readInstallMarker,
+  writeInstallMarker,
+} from './installMarker.js';
+import {
+  AmbiguousInstallPublicationError,
+  createInstallAttempt,
+  InvalidInstallTreeError,
+  publishInstallArchive,
+  publishInstallTree,
+  removeInstallAttempt,
+} from './installStaging.js';
 import {ProgressBar} from './ProgressBar.js';
 import type {BrowserProvider} from './provider.js';
 
@@ -157,13 +171,15 @@ export interface InstallOptions {
   logger?: Logger;
 }
 
+class TerminalInstallationError extends Error {}
+
 /**
  * Thrown when an installation folder is present but does not hold a browser
  * that can be launched.
  *
  * @internal
  */
-export class IncompleteInstallationError extends Error {}
+export class IncompleteInstallationError extends TerminalInstallationError {}
 
 /**
  * Install using custom provider plugins.
@@ -261,6 +277,9 @@ async function installWithProviders(
       // Download and install using the URL from the provider
       return await installUrl(url, options, provider, logger);
     } catch (err) {
+      if (err instanceof TerminalInstallationError) {
+        throw err;
+      }
       logger?.(DEBUG_PREFIXES.install)?.(
         `Provider ${provider.getName()} failed: ${(err as Error).message}`,
       );
@@ -417,16 +436,41 @@ async function installUrl(
     if (existsSync(archivePath)) {
       return archivePath;
     }
-    logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
-    debugTime('download');
-    await downloadFile(
-      url,
-      archivePath,
-      downloadProgressCallback,
-      options.expectedHash,
-    );
-    debugTimeEnd('download', logger);
-    return archivePath;
+    let attempt;
+    try {
+      attempt = await createInstallAttempt(
+        browserRoot,
+        archiveSuffix(fileName),
+      );
+    } catch (error) {
+      throw terminalError(error);
+    }
+    let canCleanup = false;
+    try {
+      logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
+      try {
+        debugTime('download');
+        await downloadFile(
+          url,
+          attempt.archivePath,
+          downloadProgressCallback,
+          options.expectedHash,
+        );
+      } finally {
+        // downloadFile only settles after its request and destination writer
+        // have stopped, so both successful and failed attempts are removable.
+        canCleanup = true;
+        debugTimeEnd('download', logger);
+      }
+      try {
+        await publishInstallArchive(attempt.archivePath, archivePath);
+      } catch (error) {
+        throw terminalError(error);
+      }
+      return archivePath;
+    } finally {
+      await cleanupInstallAttempt(attempt.path, canCleanup, logger);
+    }
   }
 
   const outputPath = cache.installationDir(
@@ -435,7 +479,30 @@ async function installUrl(
     options.buildId,
   );
 
-  // Get executable path from provider once (used for both cached and new installations)
+  const existingInstallation = inspectExistingInstall(
+    cache,
+    options.browser,
+    options.platform,
+    options.buildId,
+  );
+  if (existingInstallation) {
+    try {
+      if (existingInstallation.kind === 'legacy') {
+        await runSetup(existingInstallation.browser, logger);
+      }
+      await runPostInstallSteps(
+        cache,
+        existingInstallation.browser,
+        existingInstallation.kind,
+        options,
+        logger,
+      );
+    } catch (error) {
+      throw terminalError(error);
+    }
+    return existingInstallation.browser;
+  }
+
   const relativeExecutablePath = await provider.getExecutablePath({
     browser: options.browser,
     buildId: options.buildId,
@@ -445,51 +512,30 @@ async function installUrl(
     `Using executable path from provider: ${relativeExecutablePath}`,
   );
 
-  const installedBrowser = new InstalledBrowser(
-    cache,
-    options.browser,
-    options.buildId,
-    options.platform,
-  );
-
-  // Write metadata for the installation (only for non-default providers)
-  if (!(provider instanceof DefaultProvider)) {
-    cache.writeExecutablePath(
-      options.browser,
-      options.platform,
-      options.buildId,
-      relativeExecutablePath,
-    );
-  }
-
+  let attempt;
   try {
-    if (existsSync(outputPath)) {
-      if (!existsSync(installedBrowser.executablePath)) {
-        throw new IncompleteInstallationError(
-          `The browser folder (${outputPath}) exists but the executable (${installedBrowser.executablePath}) is missing. ` +
-            `An earlier install of this build probably did not finish. ` +
-            `Delete ${outputPath} and install the browser again.`,
-        );
-      }
-      await runSetup(installedBrowser, logger);
-      if (options.installDeps) {
-        await installDeps(installedBrowser, logger);
-      }
-      return installedBrowser;
-    }
-
-    // Check if archive already exists (e.g., from a custom provider)
+    attempt = await createInstallAttempt(browserRoot, archiveSuffix(fileName));
+  } catch (error) {
+    throw terminalError(error);
+  }
+  let canCleanup = false;
+  try {
+    let candidateArchivePath = archivePath;
     if (!existsSync(archivePath)) {
+      candidateArchivePath = attempt.archivePath;
       logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
       try {
         debugTime('download');
         await downloadFile(
           url,
-          archivePath,
+          candidateArchivePath,
           downloadProgressCallback,
           options.expectedHash,
         );
       } finally {
+        // downloadFile only settles after its request and destination writer
+        // have stopped, so both successful and failed attempts are removable.
+        canCleanup = true;
         debugTimeEnd('download', logger);
       }
     } else {
@@ -499,35 +545,71 @@ async function installUrl(
     }
 
     logger?.(DEBUG_PREFIXES.install)?.(
-      `Installing ${archivePath} to ${outputPath}`,
+      `Installing ${candidateArchivePath} to ${attempt.outputPath}`,
     );
+    canCleanup = false;
     try {
       debugTime('extract');
-      await unpackArchive(archivePath, outputPath, options.logger);
+      await unpackArchive(
+        candidateArchivePath,
+        attempt.outputPath,
+        options.logger,
+      );
+      canCleanup = true;
     } finally {
+      // DMG extraction has a separate mount-release boundary. Other archive
+      // producers only settle after their streams and direct children stop.
+      if (!candidateArchivePath.endsWith('.dmg')) {
+        canCleanup = true;
+      }
       debugTimeEnd('extract', logger);
     }
 
-    if (options.buildIdAlias) {
-      const metadata = installedBrowser.readMetadata();
-      metadata.aliases[options.buildIdAlias] = options.buildId;
-      installedBrowser.writeMetadata(metadata);
+    const stagedBrowser = {
+      browser: options.browser,
+      platform: options.platform,
+      executablePath: path.join(attempt.outputPath, relativeExecutablePath),
+    };
+    try {
+      await runSetup(stagedBrowser, logger);
+    } catch (error) {
+      throw terminalError(error);
     }
+    writeInstallMarker(attempt.outputPath, relativeExecutablePath);
 
-    await runSetup(installedBrowser, logger);
-    if (options.installDeps) {
-      await installDeps(installedBrowser, logger);
+    try {
+      await publishInstallTree(attempt.outputPath, outputPath);
+    } catch (error) {
+      throw terminalError(error);
+    }
+    const installedBrowser = new InstalledBrowser(
+      cache,
+      options.browser,
+      options.buildId,
+      options.platform,
+    );
+    try {
+      await runPostInstallSteps(
+        cache,
+        installedBrowser,
+        'new',
+        options,
+        logger,
+      );
+    } catch (error) {
+      throw terminalError(error);
     }
     return installedBrowser;
   } finally {
-    if (existsSync(archivePath)) {
-      await unlink(archivePath);
-    }
+    await cleanupInstallAttempt(attempt.path, canCleanup, logger);
   }
 }
 
 async function runSetup(
-  installedBrowser: InstalledBrowser,
+  installedBrowser: Pick<
+    InstalledBrowser,
+    'browser' | 'platform' | 'executablePath'
+  >,
   logger?: Logger,
 ): Promise<void> {
   // On Windows for Chrome invoke setup.exe to configure sandboxes.
@@ -557,6 +639,130 @@ async function runSetup(
       debugTimeEnd('permissions', logger);
     }
   }
+}
+
+function inspectExistingInstall(
+  cache: Cache,
+  browser: Browser,
+  platform: BrowserPlatform,
+  buildId: string,
+): {browser: InstalledBrowser; kind: 'new' | 'legacy'} | undefined {
+  const outputPath = cache.installationDir(browser, platform, buildId);
+  if (!existsSync(outputPath)) {
+    return;
+  }
+  let installMarker;
+  try {
+    installMarker = readInstallMarker(outputPath);
+  } catch (error) {
+    if (error instanceof InvalidInstallMarkerError) {
+      throw new IncompleteInstallationError(error.message, {cause: error});
+    }
+    throw error;
+  }
+  const installedBrowser = new InstalledBrowser(
+    cache,
+    browser,
+    buildId,
+    platform,
+  );
+  if (installMarker) {
+    return {browser: installedBrowser, kind: 'new'};
+  }
+  if (!existsSync(installedBrowser.executablePath)) {
+    throw new IncompleteInstallationError(
+      `The browser folder (${outputPath}) exists but the executable (${installedBrowser.executablePath}) is missing. ` +
+        `An earlier install of this build probably did not finish. ` +
+        `Delete ${outputPath} and install the browser again.`,
+    );
+  }
+  return {browser: installedBrowser, kind: 'legacy'};
+}
+
+async function runPostInstallSteps(
+  cache: Cache,
+  installedBrowser: InstalledBrowser,
+  kind: 'new' | 'legacy',
+  options: InstallOptions,
+  logger?: Logger,
+): Promise<void> {
+  if (kind === 'new') {
+    const installMarker = readInstallMarker(installedBrowser.path);
+    assert(installMarker, 'New install marker is missing');
+    const defaultExecutablePath = executablePathByBrowser[
+      installedBrowser.browser
+    ](installedBrowser.platform, installedBrowser.buildId);
+    if (installMarker.relativeExecutablePath === defaultExecutablePath) {
+      cache.deleteExecutablePath(
+        installedBrowser.browser,
+        installedBrowser.platform,
+        installedBrowser.buildId,
+      );
+    } else {
+      cache.writeExecutablePath(
+        installedBrowser.browser,
+        installedBrowser.platform,
+        installedBrowser.buildId,
+        installMarker.relativeExecutablePath,
+      );
+    }
+  }
+  if (options.installDeps) {
+    await installDeps(installedBrowser, logger);
+  }
+  if (options.buildIdAlias) {
+    cache.writeAlias(
+      installedBrowser.browser,
+      options.buildIdAlias,
+      installedBrowser.buildId,
+    );
+  }
+}
+
+async function cleanupInstallAttempt(
+  attemptPath: string,
+  canCleanup: boolean,
+  logger?: Logger,
+): Promise<void> {
+  if (!canCleanup) {
+    logger?.(DEBUG_PREFIXES.install)?.(
+      `Retaining install attempt because writer shutdown is not confirmed: ${attemptPath}`,
+    );
+    return;
+  }
+  try {
+    await removeInstallAttempt(attemptPath);
+  } catch (error) {
+    logger?.(DEBUG_PREFIXES.install)?.(
+      `Failed to clean up install attempt ${attemptPath}: ${(error as Error).message}`,
+    );
+  }
+}
+
+function terminalError(error: unknown): TerminalInstallationError {
+  if (error instanceof TerminalInstallationError) {
+    return error;
+  }
+  if (
+    error instanceof AmbiguousInstallPublicationError ||
+    error instanceof InvalidInstallMarkerError ||
+    error instanceof InvalidInstallTreeError
+  ) {
+    return new IncompleteInstallationError(error.message, {cause: error});
+  }
+  if (error instanceof Error) {
+    return new TerminalInstallationError(error.message, {cause: error});
+  }
+  return new TerminalInstallationError(String(error), {cause: error});
+}
+
+function archiveSuffix(fileName: string): string {
+  for (const suffix of ['.tar.bz2', '.tar.xz', '.zip', '.dmg', '.exe']) {
+    if (fileName.endsWith(suffix)) {
+      return suffix;
+    }
+  }
+  return '';
 }
 
 /**

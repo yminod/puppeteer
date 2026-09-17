@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {randomUUID} from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,7 @@ import {
 } from './browser-data/browser-data.js';
 import {DEBUG_PREFIXES, type Logger} from './debug.js';
 import {detectBrowserPlatform} from './detectPlatform.js';
+import {readInstallMarker} from './installMarker.js';
 
 /**
  * @public
@@ -152,9 +154,23 @@ export class Cache {
   }
 
   writeMetadata(browser: Browser, metadata: Metadata): void {
-    const metatadaPath = this.metadataFile(browser);
-    fs.mkdirSync(path.dirname(metatadaPath), {recursive: true});
-    fs.writeFileSync(metatadaPath, JSON.stringify(metadata, null, 2));
+    const metadataPath = this.metadataFile(browser);
+    fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
+    this.#writeMetadataFile(metadataPath, metadata);
+  }
+
+  updateMetadata(
+    browser: Browser,
+    mutator: (metadata: Metadata) => void,
+  ): boolean {
+    const metadata = this.readMetadata(browser);
+    const previous = JSON.stringify(metadata);
+    mutator(metadata);
+    if (JSON.stringify(metadata) === previous) {
+      return false;
+    }
+    this.writeMetadata(browser, metadata);
+    return true;
   }
 
   readExecutablePath(
@@ -173,13 +189,30 @@ export class Cache {
     buildId: string,
     executablePath: string,
   ): void {
-    const metadata = this.readMetadata(browser);
-    if (!metadata.executablePaths) {
-      metadata.executablePaths = {};
-    }
     const key = `${platform}-${buildId}`;
-    metadata.executablePaths[key] = executablePath;
-    this.writeMetadata(browser, metadata);
+    this.updateMetadata(browser, metadata => {
+      metadata.executablePaths ??= {};
+      metadata.executablePaths[key] = executablePath;
+    });
+  }
+
+  deleteExecutablePath(
+    browser: Browser,
+    platform: BrowserPlatform,
+    buildId: string,
+  ): void {
+    const key = `${platform}-${buildId}`;
+    this.updateMetadata(browser, metadata => {
+      if (metadata.executablePaths?.[key]) {
+        delete metadata.executablePaths[key];
+      }
+    });
+  }
+
+  writeAlias(browser: Browser, alias: string, buildId: string): void {
+    this.updateMetadata(browser, metadata => {
+      metadata.aliases[alias] = buildId;
+    });
   }
 
   resolveAlias(browser: Browser, alias: string): string | undefined {
@@ -284,6 +317,11 @@ export class Cache {
       options.buildId,
     );
 
+    const installMarker = readInstallMarker(installationDir);
+    if (installMarker) {
+      return installMarker.executablePath;
+    }
+
     const storedExecutablePath = this.readExecutablePath(
       options.browser,
       options.platform,
@@ -301,6 +339,25 @@ export class Cache {
         options.buildId,
       ),
     );
+  }
+
+  #writeMetadataFile(metadataPath: string, metadata: Metadata): void {
+    const temporaryPath = path.join(
+      path.dirname(metadataPath),
+      `.metadata-${process.pid}-${randomUUID()}`,
+    );
+    try {
+      fs.writeFileSync(temporaryPath, JSON.stringify(metadata, null, 2), {
+        flag: 'wx',
+      });
+      fs.renameSync(temporaryPath, metadataPath);
+    } finally {
+      try {
+        fs.rmSync(temporaryPath, {force: true});
+      } catch {
+        // A leftover uniquely named temp file is ignored by readers.
+      }
+    }
   }
 }
 
