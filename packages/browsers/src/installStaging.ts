@@ -29,6 +29,11 @@ export class AmbiguousInstallPublicationError extends Error {}
 /**
  * @internal
  */
+export class InstallArchivePublicationError extends Error {}
+
+/**
+ * @internal
+ */
 export class InvalidInstallTreeError extends Error {}
 
 /**
@@ -44,6 +49,7 @@ export interface InstallAttempt {
  * @internal
  */
 export const internalConstantsForTesting: {
+  link: typeof link;
   rm: (
     path: string,
     options: {
@@ -54,6 +60,7 @@ export const internalConstantsForTesting: {
     },
   ) => Promise<void>;
 } = {
+  link,
   rm,
 };
 
@@ -125,7 +132,7 @@ export async function publishInstallArchive(
   archivePath: string,
 ): Promise<void> {
   try {
-    await link(privateArchivePath, archivePath);
+    await internalConstantsForTesting.link(privateArchivePath, archivePath);
   } catch (error) {
     if (isErrnoException(error) && error.code === 'EEXIST') {
       throw new AmbiguousInstallPublicationError(
@@ -133,7 +140,11 @@ export async function publishInstallArchive(
           'Wait for the other installation to finish and retry.',
       );
     }
-    throw error;
+    throw new InstallArchivePublicationError(
+      `Failed to publish the completed archive ${archivePath} using a hard link. ` +
+        'Archive-only installation requires hard-link support from the cache filesystem.',
+      {cause: error},
+    );
   }
   try {
     await unlink(privateArchivePath);

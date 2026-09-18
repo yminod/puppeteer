@@ -13,6 +13,7 @@ import {
   extractZipWithYauzl,
   internalConstantsForTesting,
   unpackArchive,
+  unpackArchiveWithCleanupState,
 } from '../../lib/fileUtil.js';
 
 describe('fileUtil', function () {
@@ -190,6 +191,170 @@ describe('fileUtil', function () {
         'symlink pointing outside the target directory was created',
       );
       fs.renameSync(archivePath, renamedPath);
+    });
+  });
+
+  describe('DMG cleanup', () => {
+    const originalDmgExecFile = internalConstantsForTesting.dmgExecFile;
+    const originalDmgReaddir = internalConstantsForTesting.dmgReaddir;
+    const originalDelay = internalConstantsForTesting.delay;
+    const originalDetachAttempts =
+      internalConstantsForTesting.dmgDetachAttempts;
+    const originalDetachRetryDelay =
+      internalConstantsForTesting.dmgDetachRetryDelay;
+
+    afterEach(() => {
+      internalConstantsForTesting.dmgExecFile = originalDmgExecFile;
+      internalConstantsForTesting.dmgReaddir = originalDmgReaddir;
+      internalConstantsForTesting.delay = originalDelay;
+      internalConstantsForTesting.dmgDetachAttempts = originalDetachAttempts;
+      internalConstantsForTesting.dmgDetachRetryDelay =
+        originalDetachRetryDelay;
+    });
+
+    it('retries detach and reports a released mount after a transient failure', async () => {
+      let detachCalls = 0;
+      const delays: number[] = [];
+      internalConstantsForTesting.dmgReaddir = async () => {
+        return ['Firefox.app'];
+      };
+      internalConstantsForTesting.delay = async milliseconds => {
+        delays.push(milliseconds);
+      };
+      internalConstantsForTesting.dmgExecFile = async (file, args) => {
+        if (file === 'cp') {
+          return {stdout: '', stderr: ''};
+        }
+        if (args[0] === 'attach') {
+          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+        }
+        if (args[0] === 'detach') {
+          if (++detachCalls < 3) {
+            throw new Error('resource busy');
+          }
+          return {stdout: '', stderr: ''};
+        }
+        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+      };
+
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'output'),
+      );
+
+      assert.deepStrictEqual(outcome, {
+        status: 'success',
+        isSafeToCleanup: true,
+      });
+      assert.strictEqual(detachCalls, 3);
+      assert.deepStrictEqual(delays, [1000, 1000]);
+    });
+
+    it('preserves copy success when detach retries are exhausted', async () => {
+      let detachCalls = 0;
+      const messages: string[] = [];
+      internalConstantsForTesting.dmgReaddir = async () => {
+        return ['Firefox.app'];
+      };
+      internalConstantsForTesting.delay = async () => {};
+      internalConstantsForTesting.dmgExecFile = async (file, args) => {
+        if (file === 'cp') {
+          return {stdout: '', stderr: ''};
+        }
+        if (args[0] === 'attach') {
+          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+        }
+        if (args[0] === 'detach') {
+          ++detachCalls;
+          throw new Error('resource busy');
+        }
+        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+      };
+
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'output'),
+        () => {
+          return (...args: unknown[]) => {
+            messages.push(args.join(' '));
+          };
+        },
+      );
+
+      assert.deepStrictEqual(outcome, {
+        status: 'success',
+        isSafeToCleanup: false,
+      });
+      assert.strictEqual(detachCalls, 3);
+      assert.ok(
+        messages.some(message => {
+          return message.includes('Retaining DMG mount');
+        }),
+      );
+    });
+
+    it('preserves the copy error when detach retries are exhausted', async () => {
+      const copyError = new Error('copy failed');
+      let detachCalls = 0;
+      internalConstantsForTesting.dmgReaddir = async () => {
+        return ['Firefox.app'];
+      };
+      internalConstantsForTesting.delay = async () => {};
+      internalConstantsForTesting.dmgExecFile = async (file, args) => {
+        if (file === 'cp') {
+          throw copyError;
+        }
+        if (args[0] === 'attach') {
+          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+        }
+        if (args[0] === 'detach') {
+          ++detachCalls;
+          throw new Error('resource busy');
+        }
+        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+      };
+
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'output'),
+      );
+
+      assert.strictEqual(outcome.status, 'error');
+      if (outcome.status === 'error') {
+        assert.strictEqual(outcome.error, copyError);
+      }
+      assert.strictEqual(outcome.isSafeToCleanup, false);
+      assert.strictEqual(detachCalls, 3);
+    });
+
+    it('reports a failed copy as cleanup-safe after detach succeeds', async () => {
+      const copyError = new Error('copy failed');
+      internalConstantsForTesting.dmgReaddir = async () => {
+        return ['Firefox.app'];
+      };
+      internalConstantsForTesting.dmgExecFile = async (file, args) => {
+        if (file === 'cp') {
+          throw copyError;
+        }
+        if (args[0] === 'attach') {
+          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+        }
+        if (args[0] === 'detach') {
+          return {stdout: '', stderr: ''};
+        }
+        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+      };
+
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'output'),
+      );
+
+      assert.strictEqual(outcome.status, 'error');
+      if (outcome.status === 'error') {
+        assert.strictEqual(outcome.error, copyError);
+      }
+      assert.strictEqual(outcome.isSafeToCleanup, true);
     });
   });
 

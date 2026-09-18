@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {executablePathByBrowser} from '../../lib/browser-data/browser-data.js';
+import {internalConstantsForTesting as fileUtilConstants} from '../../lib/fileUtil.js';
 import {IncompleteInstallationError} from '../../lib/install.js';
 import {
   INSTALL_MARKER_FILE,
@@ -43,7 +44,7 @@ describe('install', () => {
         response.end('invalid');
         return;
       }
-      if (request.url !== '/test.zip') {
+      if (request.url !== '/test.zip' && request.url !== '/test.dmg') {
         response.writeHead(404).end();
         return;
       }
@@ -351,6 +352,126 @@ describe('install', () => {
       );
     } finally {
       internalConstantsForTesting.rm = originalRm;
+    }
+  });
+
+  it('publishes a completed DMG tree when detach retries are exhausted', async () => {
+    const originalDmgExecFile = fileUtilConstants.dmgExecFile;
+    const originalDmgReaddir = fileUtilConstants.dmgReaddir;
+    const originalDelay = fileUtilConstants.delay;
+    let detachCalls = 0;
+    const messages: string[] = [];
+    fileUtilConstants.dmgReaddir = async () => {
+      return ['Browser.app'];
+    };
+    fileUtilConstants.delay = async () => {};
+    fileUtilConstants.dmgExecFile = async (file, args) => {
+      if (file === 'cp') {
+        const outputPath = args[2]!;
+        fs.mkdirSync(path.join(outputPath, 'browser'), {recursive: true});
+        fs.writeFileSync(path.join(outputPath, 'browser', 'chrome'), 'browser');
+        return {stdout: '', stderr: ''};
+      }
+      if (args[0] === 'attach') {
+        return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
+      }
+      if (args[0] === 'detach') {
+        ++detachCalls;
+        throw new Error('resource busy');
+      }
+      throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+    };
+
+    try {
+      const installedBrowser = await install({
+        cacheDir: tmpDir,
+        browser: Browser.CHROME,
+        platform: BrowserPlatform.MAC,
+        buildId: '123',
+        providers: [new TestProvider(new URL('/test.dmg', serverUrl))],
+        baseUrl: serverUrl.origin,
+        logger: () => {
+          return (...args: unknown[]) => {
+            messages.push(args.join(' '));
+          };
+        },
+      });
+
+      assert.strictEqual(
+        fs.readFileSync(installedBrowser.executablePath, 'utf8'),
+        'browser',
+      );
+      assert.strictEqual(detachCalls, 3);
+      assert.strictEqual(
+        fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')).length,
+        1,
+      );
+      assert.ok(
+        messages.some(message => {
+          return message.includes('Retaining DMG mount');
+        }),
+      );
+    } finally {
+      fileUtilConstants.dmgExecFile = originalDmgExecFile;
+      fileUtilConstants.dmgReaddir = originalDmgReaddir;
+      fileUtilConstants.delay = originalDelay;
+    }
+  });
+
+  it('does not try another provider after copy and detach both fail', async () => {
+    const originalDmgExecFile = fileUtilConstants.dmgExecFile;
+    const originalDmgReaddir = fileUtilConstants.dmgReaddir;
+    const originalDelay = fileUtilConstants.delay;
+    const firstProvider = new TestProvider(new URL('/test.dmg', serverUrl));
+    const secondProvider = new TestProvider(serverUrl);
+    const copyError = new Error('copy failed');
+    fileUtilConstants.dmgReaddir = async () => {
+      return ['Browser.app'];
+    };
+    fileUtilConstants.delay = async () => {};
+    fileUtilConstants.dmgExecFile = async (file, args) => {
+      if (file === 'cp') {
+        throw copyError;
+      }
+      if (args[0] === 'attach') {
+        return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
+      }
+      if (args[0] === 'detach') {
+        throw new Error('resource busy');
+      }
+      throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
+    };
+
+    try {
+      await assert.rejects(
+        install({
+          cacheDir: tmpDir,
+          browser: Browser.CHROME,
+          platform: BrowserPlatform.MAC,
+          buildId: '123',
+          providers: [firstProvider, secondProvider],
+          baseUrl: serverUrl.origin,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /copy failed/);
+          assert.strictEqual(
+            (error as Error & {cause?: unknown}).cause,
+            copyError,
+          );
+          return true;
+        },
+      );
+      assert.strictEqual(firstProvider.supportsCalls, 1);
+      assert.strictEqual(secondProvider.supportsCalls, 0);
+      assert.strictEqual(
+        fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')).length,
+        1,
+      );
+    } finally {
+      fileUtilConstants.dmgExecFile = originalDmgExecFile;
+      fileUtilConstants.dmgReaddir = originalDmgReaddir;
+      fileUtilConstants.delay = originalDelay;
     }
   });
 

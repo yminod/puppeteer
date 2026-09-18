@@ -21,7 +21,7 @@ import {Cache, InstalledBrowser} from './Cache.js';
 import {debug, DEBUG_PREFIXES, type Logger} from './debug.js';
 import {DefaultProvider} from './DefaultProvider.js';
 import {detectBrowserPlatform} from './detectPlatform.js';
-import {unpackArchive} from './fileUtil.js';
+import {unpackArchiveWithCleanupState} from './fileUtil.js';
 import {downloadFile, headHttpRequest} from './httpUtil.js';
 import {
   InvalidInstallMarkerError,
@@ -104,6 +104,9 @@ export interface InstallOptions {
   baseUrl?: string;
   /**
    * Whether to unpack and install browser archives.
+   *
+   * Archive-only installation publishes a completed download using a hard
+   * link. The cache filesystem must support hard links when this is `false`.
    *
    * @defaultValue `true`
    */
@@ -519,6 +522,7 @@ async function installUrl(
     throw terminalError(error);
   }
   let canCleanup = false;
+  let hasUnreleasedResources = false;
   try {
     let candidateArchivePath = archivePath;
     if (!existsSync(archivePath)) {
@@ -550,12 +554,16 @@ async function installUrl(
     canCleanup = false;
     try {
       debugTime('extract');
-      await unpackArchive(
+      const outcome = await unpackArchiveWithCleanupState(
         candidateArchivePath,
         attempt.outputPath,
         options.logger,
       );
-      canCleanup = true;
+      canCleanup = outcome.isSafeToCleanup;
+      hasUnreleasedResources = !outcome.isSafeToCleanup;
+      if (outcome.status === 'error') {
+        throw outcome.error;
+      }
     } finally {
       // DMG extraction has a separate mount-release boundary. Other archive
       // producers only settle after their streams and direct children stop.
@@ -600,6 +608,11 @@ async function installUrl(
       throw terminalError(error);
     }
     return installedBrowser;
+  } catch (error) {
+    if (hasUnreleasedResources) {
+      throw terminalError(error);
+    }
+    throw error;
   } finally {
     await cleanupInstallAttempt(attempt.path, canCleanup, logger);
   }
@@ -726,7 +739,7 @@ async function cleanupInstallAttempt(
 ): Promise<void> {
   if (!canCleanup) {
     logger?.(DEBUG_PREFIXES.install)?.(
-      `Retaining install attempt because writer shutdown is not confirmed: ${attemptPath}`,
+      `Retaining install attempt because writer shutdown or resource release is not confirmed: ${attemptPath}`,
     );
     return;
   }

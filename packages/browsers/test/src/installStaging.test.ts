@@ -13,6 +13,7 @@ import {writeInstallMarker} from '../../lib/installMarker.js';
 import {
   AmbiguousInstallPublicationError,
   createInstallAttempt,
+  InstallArchivePublicationError,
   internalConstantsForTesting,
   publishInstallArchive,
   publishInstallTree,
@@ -164,6 +165,43 @@ describe('install staging', () => {
       'candidate',
     );
   });
+
+  for (const code of ['ENOTSUP', 'EISDIR']) {
+    it(`reports the hard-link requirement when publication fails with ${code}`, async () => {
+      const attempt = await createInstallAttempt(browserRoot);
+      const archivePath = path.join(browserRoot, 'archive.zip');
+      fs.writeFileSync(attempt.archivePath, 'candidate');
+      const linkError = Object.assign(new Error('operation not supported'), {
+        code,
+      });
+      const originalLink = internalConstantsForTesting.link;
+      internalConstantsForTesting.link = async () => {
+        throw linkError;
+      };
+
+      try {
+        await assert.rejects(
+          publishInstallArchive(attempt.archivePath, archivePath),
+          (error: unknown) => {
+            assert.ok(error instanceof InstallArchivePublicationError);
+            assert.match(error.message, /requires hard-link support/);
+            assert.strictEqual(
+              (error as Error & {cause?: unknown}).cause,
+              linkError,
+            );
+            return true;
+          },
+        );
+        assert.strictEqual(fs.existsSync(archivePath), false);
+        assert.strictEqual(
+          fs.readFileSync(attempt.archivePath, 'utf8'),
+          'candidate',
+        );
+      } finally {
+        internalConstantsForTesting.link = originalLink;
+      }
+    });
+  }
 
   function prepareOutput(outputPath: string, contents: string): string {
     const relativeExecutablePath = path.join('browser', 'executable');

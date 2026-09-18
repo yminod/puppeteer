@@ -26,42 +26,96 @@ export async function unpackArchive(
   folderPath: string,
   logger?: Logger,
 ): Promise<void> {
-  if (!path.isAbsolute(folderPath)) {
-    folderPath = path.resolve(process.cwd(), folderPath);
-  }
-  if (archivePath.endsWith('.zip')) {
-    await mkdir(folderPath, {recursive: true});
-    await extractZip(archivePath, folderPath, logger);
-  } else if (archivePath.endsWith('.tar.bz2')) {
-    await extractTar(archivePath, folderPath, 'bzip2', logger);
-  } else if (archivePath.endsWith('.dmg')) {
-    await mkdir(folderPath);
-    await installDMG(archivePath, folderPath);
-  } else if (archivePath.endsWith('.exe')) {
-    // Firefox on Windows.
-    const result = spawnSync(archivePath, [`/ExtractDir=${folderPath}`], {
-      env: {
-        __compat_layer: 'RunAsInvoker',
-      },
-    });
-    if (result.status !== 0) {
-      throw new Error(
-        `Failed to extract ${archivePath} to ${folderPath}: ${result.output}`,
-      );
-    }
-  } else if (archivePath.endsWith('.tar.xz')) {
-    await extractTar(archivePath, folderPath, 'xz');
-  } else {
-    throw new Error(`Unsupported archive format: ${archivePath}`);
+  const outcome = await unpackArchiveWithCleanupState(
+    archivePath,
+    folderPath,
+    logger,
+  );
+  if (outcome.status === 'error') {
+    throw outcome.error;
   }
 }
 
 /**
  * @internal
  */
-export const internalConstantsForTesting = {
+export type ArchiveUnpackOutcome =
+  | {status: 'success'; isSafeToCleanup: boolean}
+  | {status: 'error'; error: unknown; isSafeToCleanup: boolean};
+
+/**
+ * @internal
+ */
+export async function unpackArchiveWithCleanupState(
+  archivePath: string,
+  folderPath: string,
+  logger?: Logger,
+): Promise<ArchiveUnpackOutcome> {
+  if (!path.isAbsolute(folderPath)) {
+    folderPath = path.resolve(process.cwd(), folderPath);
+  }
+  try {
+    if (archivePath.endsWith('.zip')) {
+      await mkdir(folderPath, {recursive: true});
+      await extractZip(archivePath, folderPath, logger);
+    } else if (archivePath.endsWith('.tar.bz2')) {
+      await extractTar(archivePath, folderPath, 'bzip2', logger);
+    } else if (archivePath.endsWith('.dmg')) {
+      await mkdir(folderPath);
+      return await installDMG(archivePath, folderPath, logger);
+    } else if (archivePath.endsWith('.exe')) {
+      // Firefox on Windows.
+      const result = spawnSync(archivePath, [`/ExtractDir=${folderPath}`], {
+        env: {
+          __compat_layer: 'RunAsInvoker',
+        },
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `Failed to extract ${archivePath} to ${folderPath}: ${result.output}`,
+        );
+      }
+    } else if (archivePath.endsWith('.tar.xz')) {
+      await extractTar(archivePath, folderPath, 'xz');
+    } else {
+      throw new Error(`Unsupported archive format: ${archivePath}`);
+    }
+    return {status: 'success', isSafeToCleanup: true};
+  } catch (error) {
+    return {status: 'error', error, isSafeToCleanup: true};
+  }
+}
+
+/**
+ * @internal
+ */
+export const internalConstantsForTesting: {
+  xz: string;
+  bzip2: string;
+  dmgDetachAttempts: number;
+  dmgDetachRetryDelay: number;
+  dmgExecFile: (
+    file: string,
+    args: readonly string[],
+  ) => Promise<{stdout: string; stderr: string}>;
+  dmgReaddir: (path: string) => Promise<string[]>;
+  delay: (milliseconds: number) => Promise<void>;
+} = {
   xz: 'xz',
   bzip2: 'bzip2',
+  dmgDetachAttempts: 3,
+  dmgDetachRetryDelay: 1000,
+  dmgExecFile: async (file, args) => {
+    return await execFileAsync(file, args);
+  },
+  dmgReaddir: async directory => {
+    return await readdir(directory);
+  },
+  delay: async (milliseconds: number): Promise<void> => {
+    await new Promise(resolve => {
+      setTimeout(resolve, milliseconds);
+    });
+  },
 };
 
 /**
@@ -70,7 +124,7 @@ export const internalConstantsForTesting = {
 async function extractTar(
   tarPath: string,
   folderPath: string,
-  decompressUtilityName: keyof typeof internalConstantsForTesting,
+  decompressUtilityName: 'xz' | 'bzip2',
   logger?: Logger,
 ): Promise<void> {
   const {unpackTar} = await import('modern-tar/fs');
@@ -178,22 +232,38 @@ function normalizeUtilityError(error: Error, utilityName: string): Error {
 /**
  * @internal
  */
-async function installDMG(dmgPath: string, folderPath: string): Promise<void> {
-  const {stdout} = await execFileAsync('hdiutil', [
-    'attach',
-    '-nobrowse',
-    '-noautoopen',
-    dmgPath,
-  ]);
+async function installDMG(
+  dmgPath: string,
+  folderPath: string,
+  logger?: Logger,
+): Promise<ArchiveUnpackOutcome> {
+  let stdout: string;
+  try {
+    ({stdout} = await internalConstantsForTesting.dmgExecFile('hdiutil', [
+      'attach',
+      '-nobrowse',
+      '-noautoopen',
+      dmgPath,
+    ]));
+  } catch (error) {
+    return {status: 'error', error, isSafeToCleanup: true};
+  }
 
   const volumes = stdout.match(/\/Volumes\/(.*)/m);
   if (!volumes) {
-    throw new Error(`Could not find volume path in ${stdout}`);
+    return {
+      status: 'error',
+      error: new Error(`Could not find volume path in ${stdout}`),
+      // hdiutil reported a successful attach, but without an identity there is
+      // no way to confirm that the mounted resource was released.
+      isSafeToCleanup: false,
+    };
   }
   const mountPath = volumes[0]!;
 
+  let primaryOutcome: ArchiveUnpackOutcome;
   try {
-    const fileNames = await readdir(mountPath);
+    const fileNames = await internalConstantsForTesting.dmgReaddir(mountPath);
     const appName = fileNames.find(item => {
       return typeof item === 'string' && item.endsWith('.app');
     });
@@ -202,10 +272,46 @@ async function installDMG(dmgPath: string, folderPath: string): Promise<void> {
     }
     const mountedPath = path.join(mountPath!, appName);
 
-    await execFileAsync('cp', ['-R', mountedPath, folderPath]);
-  } finally {
-    await execFileAsync('hdiutil', ['detach', mountPath, '-quiet']);
+    await internalConstantsForTesting.dmgExecFile('cp', [
+      '-R',
+      mountedPath,
+      folderPath,
+    ]);
+    primaryOutcome = {status: 'success', isSafeToCleanup: false};
+  } catch (error) {
+    primaryOutcome = {status: 'error', error, isSafeToCleanup: false};
   }
+
+  const isSafeToCleanup = await detachDMG(mountPath, logger);
+  return {...primaryOutcome, isSafeToCleanup};
+}
+
+async function detachDMG(mountPath: string, logger?: Logger): Promise<boolean> {
+  const attempts = internalConstantsForTesting.dmgDetachAttempts;
+  for (let attempt = 1; attempt <= attempts; ++attempt) {
+    try {
+      await internalConstantsForTesting.dmgExecFile('hdiutil', [
+        'detach',
+        mountPath,
+        '-quiet',
+      ]);
+      return true;
+    } catch (error) {
+      logger?.(DEBUG_PREFIXES.fileUtil)?.(
+        `Failed to detach DMG mount ${mountPath} ` +
+          `(attempt ${attempt}/${attempts}): ${String(error)}`,
+      );
+      if (attempt < attempts) {
+        await internalConstantsForTesting.delay(
+          internalConstantsForTesting.dmgDetachRetryDelay,
+        );
+      }
+    }
+  }
+  logger?.(DEBUG_PREFIXES.fileUtil)?.(
+    `Retaining DMG mount after ${attempts} failed detach attempts: ${mountPath}`,
+  );
+  return false;
 }
 
 /**
