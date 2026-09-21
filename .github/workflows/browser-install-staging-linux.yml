@@ -257,8 +257,9 @@ jobs:
             exit 1
           fi
           xvfb-run --auto-servernum node "$cli" launch "chrome@$build_id" \
-            --path "$cache_dir" -- --version \
+            --path "$cache_dir" --dumpio -- --version \
             2>&1 | tee "$artifact_dir/launch.log"
+          grep -F "$build_id" "$artifact_dir/launch.log"
           test -x "$executable_path"
           test -f "$marker_path"
           sha256sum --check "$artifact_dir/marker-before-install-deps.sha256"
