@@ -475,7 +475,7 @@ describe('install', () => {
     }
   });
 
-  it('cleans a stopped failed attempt before provider fallback', async function () {
+  it('cleans a failed attempt before provider fallback', async function () {
     this.timeout(30_000);
     const invalidUrl = new URL('/invalid.zip', serverUrl);
 

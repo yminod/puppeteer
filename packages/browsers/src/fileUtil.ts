@@ -37,6 +37,11 @@ export async function unpackArchive(
 }
 
 /**
+ * `isSafeToCleanup` tracks resources that this module can observe directly,
+ * such as extractor processes and DMG mounts. Third-party extractors may still
+ * have internal filesystem operations that are not exposed through their
+ * public completion boundary, so attempt removal remains best effort.
+ *
  * @internal
  */
 export type ArchiveUnpackOutcome =

@@ -135,7 +135,7 @@ describe('install marker', () => {
     }, InvalidInstallMarkerError);
   });
 
-  it('allows an executable through a relative symlink inside the tree', function () {
+  it('allows a relocatable relative symlink inside the tree', function () {
     const realDir = path.join(installationDir, 'real');
     fs.mkdirSync(realDir);
     fs.writeFileSync(path.join(realDir, 'executable'), '');
@@ -152,8 +152,16 @@ describe('install marker', () => {
       throw error;
     }
     const relativeExecutablePath = path.join('linked', 'executable');
-    writeMarker({version: 1, relativeExecutablePath});
+    writeInstallMarker(installationDir, relativeExecutablePath);
 
+    assert.strictEqual(
+      readInstallMarker(installationDir)?.executablePath,
+      path.join(installationDir, relativeExecutablePath),
+    );
+
+    const publishedDir = path.join(tmpDir, 'published');
+    fs.renameSync(installationDir, publishedDir);
+    installationDir = publishedDir;
     assert.strictEqual(
       readInstallMarker(installationDir)?.executablePath,
       path.join(installationDir, relativeExecutablePath),

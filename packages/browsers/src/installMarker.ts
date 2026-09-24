@@ -142,8 +142,7 @@ function validateExecutablePath(
   }
 
   try {
-    assertRelativeSymlinkChain(installationRoot, executablePath, markerPath);
-    if (!fs.statSync(canonicalExecutablePath).isFile()) {
+    if (!fs.statSync(executablePath).isFile()) {
       throw invalidMarker(
         markerPath,
         'the executable target is not a regular file',
@@ -156,48 +155,6 @@ function validateExecutablePath(
     throw invalidMarker(markerPath, error);
   }
   return executablePath;
-}
-
-function assertRelativeSymlinkChain(
-  installationRoot: string,
-  executablePath: string,
-  markerPath: string,
-): void {
-  const pending = path
-    .relative(installationRoot, executablePath)
-    .split(path.sep);
-  const seenLinks = new Set<string>();
-  let currentPath = installationRoot;
-  while (pending.length > 0) {
-    currentPath = path.join(currentPath, pending.shift()!);
-    const stat = fs.lstatSync(currentPath);
-    if (!stat.isSymbolicLink()) {
-      continue;
-    }
-
-    if (seenLinks.has(currentPath)) {
-      throw invalidMarker(markerPath, 'the executable path has a symlink loop');
-    }
-    seenLinks.add(currentPath);
-    const linkTarget = fs.readlinkSync(currentPath);
-    if (path.isAbsolute(linkTarget)) {
-      throw invalidMarker(
-        markerPath,
-        'the executable path contains an absolute symlink',
-      );
-    }
-    const resolvedTarget = path.resolve(path.dirname(currentPath), linkTarget);
-    if (!isWithin(installationRoot, resolvedTarget)) {
-      throw invalidMarker(
-        markerPath,
-        'the executable path contains an external symlink',
-      );
-    }
-    pending.unshift(
-      ...path.relative(installationRoot, resolvedTarget).split(path.sep),
-    );
-    currentPath = installationRoot;
-  }
 }
 
 function isWithin(root: string, target: string): boolean {

@@ -566,7 +566,9 @@ async function installUrl(
       }
     } finally {
       // DMG extraction has a separate mount-release boundary. Other archive
-      // producers only settle after their streams and direct children stop.
+      // producers settle after their observable streams and direct children
+      // stop. Attempt removal remains best effort because third-party
+      // extractors may not expose all internal filesystem operations.
       if (!candidateArchivePath.endsWith('.dmg')) {
         canCleanup = true;
       }
