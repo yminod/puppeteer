@@ -18,7 +18,7 @@ concurrency:
 env:
   CI: true
   FORCE_COLOR: 0
-  SOURCE_COMMIT: 3baaae21ae316faec44703e588f5755cdfa89d00
+  SOURCE_COMMIT: 24b4e8dee65eca4fec81c19461cbb24067a65106
 
 jobs:
   package-tests:
