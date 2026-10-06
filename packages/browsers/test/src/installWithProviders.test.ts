@@ -70,7 +70,7 @@ class MockProvider implements BrowserProvider {
 }
 
 describe('Install with providers', () => {
-  setupTestServer();
+  const serverState = setupTestServer();
 
   let tmpDir: string;
 
@@ -84,53 +84,52 @@ describe('Install with providers', () => {
     }
   });
 
-  describe('with test fixtures', () => {
-    it('should handle custom provider with test archive', async function () {
-      this.timeout(30000);
+  describe('provider selection', () => {
+    it('should skip unsupported providers and use the default provider', async function () {
+      this.timeout(60000);
 
-      // Use the test.tar.bz2 fixture as a mock download
-      const fixturePath = path.join(
-        import.meta.dirname,
-        '..',
-        'fixtures',
-        'test.tar.bz2',
-      );
-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
+      const calledMethods = new Set<string>();
+      const unsupportedProvider: BrowserProvider = {
+        supports() {
+          calledMethods.add('supports');
+          return false;
+        },
+        getDownloadUrl() {
+          calledMethods.add('getDownloadUrl');
+          return null;
+        },
+        getExecutablePath() {
+          calledMethods.add('getExecutablePath');
+          return path.join('unused', 'chrome');
+        },
+        getName() {
+          return 'UnsupportedProvider';
+        },
+      };
 
-      // Copy the fixture to simulate a download
-      fs.copyFileSync(fixturePath, archivePath);
-
-      const customProvider = new MockProvider({
-        supports: true,
-        getDownloadUrlResult: new URL(`file://${archivePath}`),
-        getExecutablePath: path.join(tmpDir, 'test-executable'),
+      const result = await install({
+        cacheDir: tmpDir,
+        browser: Browser.CHROME,
+        platform: BrowserPlatform.LINUX,
+        buildId: testChromeBuildId,
+        providers: [unsupportedProvider],
+        baseUrl: getServerUrl(),
       });
 
-      // Will likely fail on extraction since test.tar.bz2 is not a real browser archive.
-      // The important thing is that the custom downloader flow is exercised.
-      try {
-        await install({
-          cacheDir: tmpDir,
-          browser: Browser.CHROME,
-          platform: BrowserPlatform.LINUX,
-          buildId: 'test-build',
-          providers: [customProvider],
-          baseUrl: getServerUrl(),
-        });
-        // If it succeeds with the fixture, that's unexpected but not wrong
-      } catch (error) {
-        // Expected to fail on extraction, but not due to provider interface issues.
-        assert(error instanceof Error);
-        assert(!error.message.includes('supports'));
-        // Allow 'download' related messages since they indicate the provider worked.
-        assert(error.message.includes('All providers failed'));
-        // Verify the provider name appears in the error message
-        assert(error.message.includes('MockProvider'));
-      }
+      assert.deepStrictEqual(calledMethods, new Set(['supports']));
+      assert.strictEqual(
+        result.executablePath,
+        path.join(
+          tmpDir,
+          'chrome',
+          `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
+          'chrome-linux64',
+          'chrome',
+        ),
+      );
+      assert.ok(fs.statSync(result.executablePath).isFile());
     });
-  });
 
-  describe('provider chaining with real downloads', () => {
     it('should fall back from custom provider to default provider', async function () {
       this.timeout(60000);
 
@@ -158,29 +157,70 @@ describe('Install with providers', () => {
     it('should use first successful provider in chain', async function () {
       this.timeout(60000);
 
+      const buildId = '123';
+      const customExecutablePath = path.join('browser', 'chrome');
+      const archive = fs.readFileSync(
+        path.join(import.meta.dirname, '..', 'fixtures', 'test.zip'),
+      );
+      serverState.server.setRoute(
+        '/provider-chain.zip',
+        (_request, response) => {
+          response.writeHead(200, {'content-length': archive.length});
+          response.end(archive);
+        },
+      );
+      const downloadUrl = new URL(`${getServerUrl()}/provider-chain.zip`);
+
       // First provider fails
       const failingProvider = new MockProvider({
+        name: 'FailingProvider',
         supports: true,
         getDownloadUrlError: new Error('First source failed'),
       });
 
-      // Second provider also fails (will fall back to default provider)
-      const secondFailingProvider = new MockProvider({
-        supports: true,
-        getDownloadUrlError: new Error('Second source failed'),
+      const successfulProvider = new MockProvider({
+        name: 'SuccessfulProvider',
+        getDownloadUrlResult: downloadUrl,
+        getExecutablePath: customExecutablePath,
       });
+      const laterProvider = new MockProvider({
+        name: 'LaterProvider',
+        getDownloadUrlResult: downloadUrl,
+        getExecutablePath: customExecutablePath,
+      });
+      const providers = [failingProvider, successfulProvider, laterProvider];
+      const visitedProviders: string[] = [];
+      for (const provider of providers) {
+        const supports = provider.supports.bind(provider);
+        provider.supports = options => {
+          visitedProviders.push(provider.getName());
+          return supports(options);
+        };
+      }
 
-      // Should eventually succeed with default provider
       const result = await install({
         cacheDir: tmpDir,
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
-        providers: [failingProvider, secondFailingProvider],
+        buildId,
+        providers,
+        baseUrl: getServerUrl(),
       });
 
-      assert(result);
-      assert.strictEqual(typeof result.executablePath, 'string');
+      assert.deepStrictEqual(visitedProviders, [
+        'FailingProvider',
+        'SuccessfulProvider',
+      ]);
+      assert.strictEqual(
+        result.executablePath,
+        path.join(
+          tmpDir,
+          'chrome',
+          `${BrowserPlatform.LINUX}-${buildId}`,
+          customExecutablePath,
+        ),
+      );
+      assert.ok(fs.statSync(result.executablePath).isFile());
     });
 
     it('should include provider names in error message when all providers fail', async function () {
@@ -218,49 +258,34 @@ describe('Install with providers', () => {
     });
   });
 
-  describe('getExecutablePath integration', () => {
-    it('should use custom getExecutablePath when provided', async function () {
-      this.timeout(60000);
-
-      const customExecutablePath = '/custom/executable/path';
-
-      // Use a failing custom provider so it falls back to default provider
-      // but test that getExecutablePath would be used if the provider succeeded
-      const providerWithCustomPath = new MockProvider({
-        supports: false, // Will fall back to default provider
-        getExecutablePath: customExecutablePath,
-      });
-
-      const result = await install({
-        cacheDir: tmpDir,
-        browser: Browser.CHROME,
-        platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
-        providers: [providerWithCustomPath],
-        baseUrl: getServerUrl(),
-      });
-
-      // Since default provider is used, we get the real executable path
-      // But the test verifies that the provider interface accepts getExecutablePath
-      assert(result);
-      assert.strictEqual(typeof result.executablePath, 'string');
-      assert(result.executablePath !== customExecutablePath); // Should be default provider path
-    });
-  });
-
   describe('persistence', () => {
     it('should persist executable path in metadata for custom providers', async function () {
       this.timeout(60000);
 
-      // Use the test server archive through a custom provider. The redundant
-      // path component keeps the executable valid while making it distinct
-      // from the default provider's spelling.
+      const buildId = '123';
+      const customExecutablePath = path.join('browser', 'chrome');
+      const expectedExecutablePath = path.join(
+        tmpDir,
+        'chrome',
+        `${BrowserPlatform.LINUX}-${buildId}`,
+        customExecutablePath,
+      );
+      const archive = fs.readFileSync(
+        path.join(import.meta.dirname, '..', 'fixtures', 'test.zip'),
+      );
+      serverState.server.setRoute(
+        '/custom-provider.zip',
+        (_request, response) => {
+          response.writeHead(200, {'content-length': archive.length});
+          response.end(archive);
+        },
+      );
+
+      // The fixture uses a genuinely different layout from the default provider.
       const customProvider = new MockProvider({
         supports: true,
-        getDownloadUrlResult: new URL(
-          `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
-        ),
-        getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
+        getDownloadUrlResult: new URL(`${getServerUrl()}/custom-provider.zip`),
+        getExecutablePath: customExecutablePath,
       });
 
       // Install using custom provider
@@ -268,10 +293,16 @@ describe('Install with providers', () => {
         cacheDir: tmpDir,
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
+        buildId,
         providers: [customProvider],
         baseUrl: getServerUrl(),
       });
+
+      assert.strictEqual(result.executablePath, expectedExecutablePath);
+      assert.strictEqual(
+        fs.readFileSync(expectedExecutablePath, 'utf8'),
+        '#!/bin/sh\necho chrome\n',
+      );
 
       // Verify .metadata exists at browser root and contains the executable path
       const metadataPath = path.join(tmpDir, 'chrome', '.metadata');
@@ -281,21 +312,22 @@ describe('Install with providers', () => {
       );
 
       const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
-      assert.ok(
+      const key = `${BrowserPlatform.LINUX}-${buildId}`;
+      assert.strictEqual(
         metadata.executablePaths?.[key],
-        'Metadata should contain the executable path',
+        customExecutablePath,
+        'Metadata should contain the exact custom executable path',
       );
 
-      // Verify getInstalledBrowsers uses the persisted path
+      // Verify getInstalledBrowsers returns the expected custom executable path.
       const installed = await getInstalledBrowsers({cacheDir: tmpDir});
       const found = installed.find(b => {
-        return b.buildId === testChromeBuildId;
+        return b.buildId === buildId;
       });
       assert.ok(found, 'Should find the installed browser');
       assert.strictEqual(
         found?.executablePath,
-        result.executablePath,
+        expectedExecutablePath,
         'getInstalledBrowsers should return the correct executable path',
       );
     });
@@ -303,43 +335,28 @@ describe('Install with providers', () => {
     it('should remove a stale custom path after a default provider installation', async function () {
       this.timeout(60000);
 
-      // Create a successful custom provider with a valid, non-default path.
-      const customProvider = new MockProvider({
-        supports: true,
-        getDownloadUrlResult: new URL(
-          `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
-        ),
-        getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
-      });
-
-      // Install using custom provider first
-      await install({
-        cacheDir: tmpDir,
-        browser: Browser.CHROME,
-        platform: BrowserPlatform.LINUX,
-        buildId: testChromeBuildId,
-        providers: [customProvider],
-        baseUrl: getServerUrl(),
-      });
-
-      // Verify .metadata was created by custom provider
+      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
       const metadataPath = path.join(tmpDir, 'chrome', '.metadata');
-      assert.ok(
-        fs.existsSync(metadataPath),
-        '.metadata should exist after custom provider install',
-      );
-
-      // Now install using default provider (no providers option)
-      // First, clean up the installation but keep the metadata
-      const installDir = path.join(
+      const expectedExecutablePath = path.join(
         tmpDir,
         'chrome',
-        `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
+        key,
+        'chrome-linux64',
+        'chrome',
       );
-      fs.rmSync(installDir, {recursive: true, force: true});
+
+      // Seed the registration left behind after a custom install was removed.
+      fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
+      fs.writeFileSync(
+        metadataPath,
+        JSON.stringify({
+          aliases: {},
+          executablePaths: {[key]: path.join('browser', 'chrome')},
+        }),
+      );
 
       // Install using default provider
-      await install({
+      const result = await install({
         cacheDir: tmpDir,
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
@@ -348,9 +365,11 @@ describe('Install with providers', () => {
         // No providers option = uses default provider
       });
 
+      assert.strictEqual(result.executablePath, expectedExecutablePath);
+      assert.ok(fs.statSync(expectedExecutablePath).isFile());
+
       // The completed default-layout install reconciles the stale custom path.
       const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
       assert.strictEqual(
         metadata.executablePaths?.[key],
         undefined,
@@ -410,12 +429,23 @@ describe('Install with providers', () => {
     });
   });
 
-  describe('platform-specific behavior', () => {
-    it('should work across different platforms', async function () {
+  describe('platform options and cache identity', () => {
+    it('should forward platform options and keep installations separate', async function () {
       this.timeout(60000);
 
-      // Test with different platforms - this tests that the downloader interface
-      // works consistently across platforms
+      const buildId = '123';
+      const customExecutablePath = path.join('browser', 'chrome');
+      // This fixture models extraction and registration, not binary compatibility.
+      const archive = fs.readFileSync(
+        path.join(import.meta.dirname, '..', 'fixtures', 'test.zip'),
+      );
+      serverState.server.setRoute(
+        '/platform-provider.zip',
+        (_request, response) => {
+          response.writeHead(200, {'content-length': archive.length});
+          response.end(archive);
+        },
+      );
       const platforms = [
         BrowserPlatform.LINUX,
         BrowserPlatform.MAC,
@@ -423,23 +453,71 @@ describe('Install with providers', () => {
       ];
 
       for (const platform of platforms) {
-        const provider = new MockProvider({
-          getDownloadUrlResult: new URL(
-            `${getServerUrl()}/${testChromeBuildId}/linux64/chrome-linux64.zip`,
-          ),
-          getExecutablePath: 'chrome-linux64/../chrome-linux64/chrome',
-        });
+        const calledMethods = new Set<string>();
+        const checkOptions = (
+          method: string,
+          options: DownloadOptions,
+        ): void => {
+          calledMethods.add(method);
+          assert.strictEqual(options.browser, Browser.CHROME);
+          assert.strictEqual(options.platform, platform);
+          assert.strictEqual(options.buildId, buildId);
+        };
+        const provider: BrowserProvider = {
+          supports(options) {
+            checkOptions('supports', options);
+            return true;
+          },
+          getDownloadUrl(options) {
+            checkOptions('getDownloadUrl', options);
+            return new URL(`${getServerUrl()}/platform-provider.zip`);
+          },
+          getExecutablePath(options) {
+            checkOptions('getExecutablePath', options);
+            return customExecutablePath;
+          },
+          getName() {
+            return 'PlatformTestProvider';
+          },
+        };
         const result = await install({
           cacheDir: tmpDir,
           browser: Browser.CHROME,
           platform,
-          buildId: testChromeBuildId,
+          buildId,
           providers: [provider],
           baseUrl: getServerUrl(),
         });
 
-        assert(result);
-        assert.strictEqual(typeof result.path, 'string');
+        assert.deepStrictEqual(
+          calledMethods,
+          new Set(['supports', 'getDownloadUrl', 'getExecutablePath']),
+        );
+        const expectedInstallDir = path.join(
+          tmpDir,
+          'chrome',
+          `${platform}-${buildId}`,
+        );
+        assert.strictEqual(result.platform, platform);
+        assert.strictEqual(result.path, expectedInstallDir);
+        assert.strictEqual(
+          result.executablePath,
+          path.join(expectedInstallDir, customExecutablePath),
+        );
+      }
+
+      const installed = await getInstalledBrowsers({cacheDir: tmpDir});
+      assert.deepStrictEqual(
+        installed
+          .map(b => {
+            return b.platform;
+          })
+          .sort(),
+        [...platforms].sort(),
+      );
+      for (const browser of installed) {
+        assert.strictEqual(browser.buildId, buildId);
+        assert.ok(fs.statSync(browser.executablePath).isFile());
       }
     });
   });
