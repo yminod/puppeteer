@@ -143,21 +143,57 @@ export async function downloadFile(
   }
 
   let downloadedBytes = 0;
-  const totalBytes = Number.parseInt(
-    response.headers['content-length'] ?? '0',
+  const contentLength = Number.parseInt(
+    response.headers['content-length'] ?? '',
     10,
   );
+  const totalBytes = Number.isFinite(contentLength) ? contentLength : undefined;
+  const downloadError = (cause: unknown): Error => {
+    if (totalBytes === undefined) {
+      return new Error(
+        `Download failed: connection closed before the download completed. URL: ${url}`,
+        {cause},
+      );
+    }
+    return new Error(
+      `Download failed: expected ${totalBytes} bytes, received ${downloadedBytes} bytes. URL: ${url}`,
+      {cause},
+    );
+  };
+  let firstError: unknown;
+  let responseError: Error | undefined;
   const verifier = expectedHash ? new HashVerifier() : null;
   const progress = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       downloadedBytes += chunk.length;
       verifier?.update(chunk);
-      progressCallback?.(downloadedBytes, totalBytes);
+      progressCallback?.(downloadedBytes, totalBytes ?? 0);
       callback(null, chunk);
     },
   });
 
-  await pipeline(response, progress, createWriteStream(destinationPath));
+  const destination = createWriteStream(destinationPath);
+  destination.once('error', error => {
+    firstError ??= error;
+  });
+  response.once('error', error => {
+    if (!firstError) {
+      responseError = error;
+    }
+    firstError ??= error;
+  });
+  try {
+    await pipeline(response, progress, destination);
+  } catch (error) {
+    // pipeline waits for teardown before removing the partial download.
+    try {
+      unlinkSync(destinationPath);
+    } catch {}
+    if (!response.complete && error === responseError) {
+      throw downloadError(error);
+    }
+    throw error;
+  }
   if (verifier && expectedHash) {
     verifier.verify(url, destinationPath, expectedHash);
   }
