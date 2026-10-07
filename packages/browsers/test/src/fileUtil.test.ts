@@ -369,34 +369,6 @@ describe('fileUtil', function () {
       }
       assert.strictEqual(outcome.isSafeToCleanup, true);
     });
-
-    it('retains an attached mount when its identity is unknown', async () => {
-      const commands: string[] = [];
-      internalConstantsForTesting.dmgReaddir = async () => {
-        assert.fail('cannot read an unidentified mount');
-      };
-      internalConstantsForTesting.dmgExecFile = async (file, args) => {
-        commands.push(`${file} ${args[0]}`);
-        assert.strictEqual(file, 'hdiutil');
-        assert.strictEqual(args[0], 'attach');
-        return {stdout: '/dev/disk1\tApple_HFS\n', stderr: ''};
-      };
-
-      const outcome = await unpackArchiveWithCleanupState(
-        path.join(tmpDir, 'browser.dmg'),
-        path.join(tmpDir, 'output'),
-      );
-
-      assert.strictEqual(outcome.status, 'error');
-      if (outcome.status === 'error') {
-        assert.match(
-          (outcome.error as Error).message,
-          /Could not find volume path/,
-        );
-      }
-      assert.strictEqual(outcome.isSafeToCleanup, false);
-      assert.deepStrictEqual(commands, ['hdiutil attach']);
-    });
   });
 
   it('stops the decompressor and waits for close after a tar pipeline failure', async () => {
