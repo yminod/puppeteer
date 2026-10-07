@@ -24,6 +24,11 @@ import {detectBrowserPlatform} from './detectPlatform.js';
 import {unpackArchiveWithCleanupState} from './fileUtil.js';
 import {downloadFile, headHttpRequest} from './httpUtil.js';
 import {
+  installLockPath,
+  withInstallLock,
+  type InstallLockOptions,
+} from './installLock.js';
+import {
   InvalidInstallMarkerError,
   readInstallMarker,
   writeInstallMarker,
@@ -40,6 +45,18 @@ import {ProgressBar} from './ProgressBar.js';
 import type {BrowserProvider} from './provider.js';
 
 const times = new Map<string, [number, number]>();
+
+/**
+ * Experiment-only injection point. Each research worker has its own module
+ * instance; this is not exported by main.ts or added to InstallOptions.
+ *
+ * @internal
+ */
+export const installLockForTesting: {
+  withInstallLock: typeof withInstallLock;
+  options: InstallLockOptions;
+} = {withInstallLock, options: {}};
+
 function debugTime(label: string) {
   times.set(label, process.hrtime());
 }
@@ -340,7 +357,19 @@ export async function install(
 
   // Always use plugin architecture (uses default provider if none specified)
   options.providers ??= [];
-  return await installWithProviders(options);
+  const logger = options.logger(DEBUG_PREFIXES.install);
+  return await installLockForTesting.withInstallLock(
+    installLockPath(
+      new Cache(options.cacheDir, options.logger),
+      options.browser,
+      options.platform,
+      options.buildId,
+    ),
+    async () => {
+      return await installWithProviders(options);
+    },
+    {...installLockForTesting.options, logger, warningLogger: logger},
+  );
 }
 
 async function installDeps(

@@ -1,0 +1,163 @@
+name: Browser install staging and lock Linux experiment
+
+# Transport the frozen MI1 trial on its own branch. Do not check out the old
+# staging-only commit: both jobs must test this workflow's exact push commit.
+on:
+  push:
+    branches:
+      - experiment/browser-install-staging-lock-linux-2026-10-08
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: browser-install-staging-lock-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  FORCE_COLOR: 0
+  VALIDATION_RUNNER: .github/experiments/staging-lock-integration-2026-10-08/run-validation.mjs
+
+jobs:
+  integration:
+    name: Recovery, competing generations, and comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact experiment commit and discovery history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the MI1 Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: '24.15.0'
+
+      - name: Record Linux environment and verify frozen inputs
+        run: |
+          artifact_dir="$RUNNER_TEMP/staging-lock-linux-integration"
+          mkdir -p "$artifact_dir"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            node --version
+            npm --version
+            git rev-parse HEAD
+            id
+            findmnt -T "$GITHUB_WORKSPACE"
+            findmnt -T "$artifact_dir"
+            df -h "$artifact_dir"
+          } | tee "$artifact_dir/environment.log"
+          node "$VALIDATION_RUNNER" verify --require-linux-ext4 --output="$artifact_dir"
+
+      - name: Install the committed dependencies
+        run: |
+          npm ci 2>&1 | tee "$RUNNER_TEMP/staging-lock-linux-integration/npm-ci.log"
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
+
+      - name: Build the browser package
+        run: |
+          npm run build --workspace @puppeteer/browsers 2>&1 | tee "$RUNNER_TEMP/staging-lock-linux-integration/build.log"
+
+      - name: Run the deterministic integration and comparison
+        run: |
+          node "$VALIDATION_RUNNER" integration --require-linux-ext4 \
+            --output="$RUNNER_TEMP/staging-lock-linux-integration"
+
+      - name: Upload all integration evidence, including failures
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-lock-linux-integration
+          path: ${{ runner.temp }}/staging-lock-linux-integration
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+  package-tests:
+    name: Package regression and native extractors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact experiment commit and discovery history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the MI1 Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: '24.15.0'
+
+      - name: Record Linux environment and verify frozen inputs
+        run: |
+          artifact_dir="$RUNNER_TEMP/staging-lock-linux-package"
+          mkdir -p "$artifact_dir"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            node --version
+            npm --version
+            git rev-parse HEAD
+            id
+            findmnt -T "$GITHUB_WORKSPACE"
+            findmnt -T "$artifact_dir"
+            xz --version | sed -n '1p'
+            bzip2 --version 2>&1 | sed -n '1p'
+            tar --version | sed -n '1p'
+          } | tee "$artifact_dir/environment.log"
+          node "$VALIDATION_RUNNER" verify --require-linux-ext4 --output="$artifact_dir"
+
+      - name: Allow browser sandbox user namespaces
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+
+      - name: Install the committed dependencies
+        run: |
+          npm ci 2>&1 | tee "$RUNNER_TEMP/staging-lock-linux-package/npm-ci.log"
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
+
+      - name: Build the browser package and tests
+        run: |
+          artifact_dir="$RUNNER_TEMP/staging-lock-linux-package"
+          npm run build --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build.log"
+          npm run build:test --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build-test.log"
+
+      - name: Run the full browser package
+        run: |
+          npm test --workspace @puppeteer/browsers 2>&1 | tee "$RUNNER_TEMP/staging-lock-linux-package/package-test.log"
+
+      - name: Confirm both lock suites and native extractors ran
+        run: |
+          log="$RUNNER_TEMP/staging-lock-linux-package/package-test.log"
+          rg -F 'installLock generation experiment' "$log"
+          rg -F 'installLockBaseline' "$log"
+          rg -F 'unpacks tar.xz' "$log"
+          rg -F 'unpacks tar.bz2' "$log"
+          rg -F 'should download a buildId that is a bzip2 archive' "$log"
+          rg -F 'converges concurrent installs on a completed tree' "$log"
+
+      - name: Upload package evidence, including failures
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-lock-linux-package
+          path: ${{ runner.temp }}/staging-lock-linux-package
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

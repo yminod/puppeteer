@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "sourceBase": "6c525bc1ed41075a673c48180297d15b7b0d001f",
+  "experimentBranch": "experiment/browser-install-staging-lock-linux-2026-10-08",
+  "node": "v24.15.0",
+  "macEvidenceId": "MI1",
+  "macCombinedSourcePatchSha256": "00182e6e0a67db40ddd00a4c03fe260aca27a9adc57f9abffca1050999e52560",
+  "sourceFiles": [
+    {
+      "path": "packages/browsers/src/install.ts",
+      "sha256": "44fa5d48288fb4b5b1170e212ad659806780b814601000879917097c196346db"
+    },
+    {
+      "path": "packages/browsers/src/installLock.ts",
+      "sha256": "c9e80e6164f58efc4101be498f3792e805f381886b9596f54becbfb9b8a55303"
+    },
+    {
+      "path": "packages/browsers/src/installLockBaseline.ts",
+      "sha256": "2842fc25b2ad27c54eb7b52dfa521aaaec19a0c3eb501eb3c0b2210973a45100"
+    },
+    {
+      "path": "packages/browsers/test/src/installLock.test.ts",
+      "sha256": "a70b9dab85e24cd63acfe58fba81a998bfa2645a87caf9f580aeb0bccba614d6"
+    },
+    {
+      "path": "packages/browsers/test/src/installLockBaseline.test.ts",
+      "sha256": "3934b0b36fe9560bd8d7f8a407a3fac3c928a3e0b3fa1e51360066a760be7a1b"
+    }
+  ],
+  "harnessFiles": [
+    {
+      "path": ".github/experiments/staging-lock-integration-2026-10-08/staging-lock-integration-2026-10-08.mjs",
+      "sha256": "cb00124fb8cf4060625c66e98213d0c9e97e520ac5d414abdc7011a6b313cdec"
+    },
+    {
+      "path": ".github/experiments/staging-lock-integration-2026-10-08/staging-lock-integration-worker-2026-10-08.mjs",
+      "sha256": "24987b935ee0543526da1570bc19093758065178756c231a69fd3a45e5146745"
+    }
+  ],
+  "upstreamDiscoveryCommit": "c91da4f32ceffed3696334376aabcd1a1c19d41e",
+  "expectedCases": {
+    "none": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "PERF",
+      "DISCOVERY"
+    ],
+    "baseline": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "C1",
+      "C1.helper",
+      "PERF",
+      "DISCOVERY"
+    ],
+    "negative-control": ["C5"],
+    "generation": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "C1",
+      "C1.helper",
+      "C2.foreign",
+      "C3.empty",
+      "C3.malformed",
+      "C3.missing",
+      "C3.freshened",
+      "C3.initial",
+      "C4.renameRace",
+      "C4",
+      "C5",
+      "C6.initial",
+      "C6.refresh",
+      "C6.release",
+      "C6.primary",
+      "C7.archive",
+      "C7.download",
+      "C7.postPublication",
+      "15318.empty",
+      "15318.missing-executable",
+      "15318.invalid-marker",
+      "PERF",
+      "DISCOVERY"
+    ]
+  }
+}
