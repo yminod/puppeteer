@@ -145,12 +145,12 @@ jobs:
       - name: Confirm both lock suites and native extractors ran
         run: |
           log="$RUNNER_TEMP/staging-lock-linux-package/package-test.log"
-          rg -F 'installLock generation experiment' "$log"
-          rg -F 'installLockBaseline' "$log"
-          rg -F 'unpacks tar.xz' "$log"
-          rg -F 'unpacks tar.bz2' "$log"
-          rg -F 'should download a buildId that is a bzip2 archive' "$log"
-          rg -F 'converges concurrent installs on a completed tree' "$log"
+          grep -F 'installLock generation experiment' "$log"
+          grep -F 'installLockBaseline' "$log"
+          grep -F 'unpacks tar.xz' "$log"
+          grep -F 'unpacks tar.bz2' "$log"
+          grep -F 'should download a buildId that is a bzip2 archive' "$log"
+          grep -F 'converges concurrent installs on a completed tree' "$log"
 
       - name: Upload package evidence, including failures
         if: ${{ !cancelled() }}
