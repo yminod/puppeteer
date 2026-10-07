@@ -5,9 +5,14 @@
  */
 
 import assert from 'node:assert';
+import childProcess from 'node:child_process';
 import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+
+import sinon from 'sinon';
+import yauzl from 'yauzl';
 
 import {
   extractZipWithYauzl,
@@ -131,18 +136,24 @@ describe('fileUtil', function () {
   });
 
   describe('extractZipWithYauzl', () => {
+    afterEach(() => {
+      sinon.restore();
+    });
+
     it('extracts every entry with its structure and contents', async () => {
       await extractZipWithYauzl(path.join(fixturesPath, 'test.zip'), tmpDir);
       assertTestZipUnpacked();
     });
 
     it('resolves after closing the archive', async () => {
+      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
       const archivePath = path.join(tmpDir, 'archive.zip');
       const renamedPath = path.join(tmpDir, 'closed.zip');
       const outputPath = path.join(tmpDir, 'output');
       fs.copyFileSync(path.join(fixturesPath, 'test.zip'), archivePath);
 
       await extractZipWithYauzl(archivePath, outputPath);
+      assert.ok(events.calledWith('close'), 'archive was not closed');
       fs.renameSync(archivePath, renamedPath);
     });
 
@@ -170,6 +181,7 @@ describe('fileUtil', function () {
     // The target is validated before any symlink is created, so unlike the
     // preceding symlink test the rejection can be checked on Windows too.
     it('rejects symlinks that point outside the target directory', async () => {
+      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
       const archivePath = path.join(tmpDir, 'escape.zip');
       const renamedPath = path.join(tmpDir, 'closed-escape.zip');
       fs.copyFileSync(
@@ -186,6 +198,7 @@ describe('fileUtil', function () {
           return true;
         },
       );
+      assert.ok(events.calledWith('close'), 'archive was not closed');
       assert.ok(
         !fs.existsSync(path.join(tmpDir, 'browser', 'evil-link')),
         'symlink pointing outside the target directory was created',
@@ -214,19 +227,19 @@ describe('fileUtil', function () {
 
     it('retries detach and reports a released mount after a transient failure', async () => {
       let detachCalls = 0;
-      const delays: number[] = [];
+      let delayCalls = 0;
       internalConstantsForTesting.dmgReaddir = async () => {
-        return ['Firefox.app'];
+        return ['Browser.app'];
       };
-      internalConstantsForTesting.delay = async milliseconds => {
-        delays.push(milliseconds);
+      internalConstantsForTesting.delay = async () => {
+        ++delayCalls;
       };
       internalConstantsForTesting.dmgExecFile = async (file, args) => {
         if (file === 'cp') {
           return {stdout: '', stderr: ''};
         }
         if (args[0] === 'attach') {
-          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
         }
         if (args[0] === 'detach') {
           if (++detachCalls < 3) {
@@ -238,7 +251,7 @@ describe('fileUtil', function () {
       };
 
       const outcome = await unpackArchiveWithCleanupState(
-        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'browser.dmg'),
         path.join(tmpDir, 'output'),
       );
 
@@ -247,14 +260,14 @@ describe('fileUtil', function () {
         isSafeToCleanup: true,
       });
       assert.strictEqual(detachCalls, 3);
-      assert.deepStrictEqual(delays, [1000, 1000]);
+      assert.strictEqual(delayCalls, 2);
     });
 
     it('preserves copy success when detach retries are exhausted', async () => {
       let detachCalls = 0;
       const messages: string[] = [];
       internalConstantsForTesting.dmgReaddir = async () => {
-        return ['Firefox.app'];
+        return ['Browser.app'];
       };
       internalConstantsForTesting.delay = async () => {};
       internalConstantsForTesting.dmgExecFile = async (file, args) => {
@@ -262,7 +275,7 @@ describe('fileUtil', function () {
           return {stdout: '', stderr: ''};
         }
         if (args[0] === 'attach') {
-          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
         }
         if (args[0] === 'detach') {
           ++detachCalls;
@@ -272,7 +285,7 @@ describe('fileUtil', function () {
       };
 
       const outcome = await unpackArchiveWithCleanupState(
-        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'browser.dmg'),
         path.join(tmpDir, 'output'),
         () => {
           return (...args: unknown[]) => {
@@ -297,7 +310,7 @@ describe('fileUtil', function () {
       const copyError = new Error('copy failed');
       let detachCalls = 0;
       internalConstantsForTesting.dmgReaddir = async () => {
-        return ['Firefox.app'];
+        return ['Browser.app'];
       };
       internalConstantsForTesting.delay = async () => {};
       internalConstantsForTesting.dmgExecFile = async (file, args) => {
@@ -305,7 +318,7 @@ describe('fileUtil', function () {
           throw copyError;
         }
         if (args[0] === 'attach') {
-          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
         }
         if (args[0] === 'detach') {
           ++detachCalls;
@@ -315,7 +328,7 @@ describe('fileUtil', function () {
       };
 
       const outcome = await unpackArchiveWithCleanupState(
-        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'browser.dmg'),
         path.join(tmpDir, 'output'),
       );
 
@@ -330,14 +343,14 @@ describe('fileUtil', function () {
     it('reports a failed copy as cleanup-safe after detach succeeds', async () => {
       const copyError = new Error('copy failed');
       internalConstantsForTesting.dmgReaddir = async () => {
-        return ['Firefox.app'];
+        return ['Browser.app'];
       };
       internalConstantsForTesting.dmgExecFile = async (file, args) => {
         if (file === 'cp') {
           throw copyError;
         }
         if (args[0] === 'attach') {
-          return {stdout: '/dev/disk1\t/Volumes/Firefox\n', stderr: ''};
+          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
         }
         if (args[0] === 'detach') {
           return {stdout: '', stderr: ''};
@@ -346,7 +359,7 @@ describe('fileUtil', function () {
       };
 
       const outcome = await unpackArchiveWithCleanupState(
-        path.join(tmpDir, 'firefox.dmg'),
+        path.join(tmpDir, 'browser.dmg'),
         path.join(tmpDir, 'output'),
       );
 
@@ -356,6 +369,73 @@ describe('fileUtil', function () {
       }
       assert.strictEqual(outcome.isSafeToCleanup, true);
     });
+
+    it('retains an attached mount when its identity is unknown', async () => {
+      const commands: string[] = [];
+      internalConstantsForTesting.dmgReaddir = async () => {
+        assert.fail('cannot read an unidentified mount');
+      };
+      internalConstantsForTesting.dmgExecFile = async (file, args) => {
+        commands.push(`${file} ${args[0]}`);
+        assert.strictEqual(file, 'hdiutil');
+        assert.strictEqual(args[0], 'attach');
+        return {stdout: '/dev/disk1\tApple_HFS\n', stderr: ''};
+      };
+
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(tmpDir, 'browser.dmg'),
+        path.join(tmpDir, 'output'),
+      );
+
+      assert.strictEqual(outcome.status, 'error');
+      if (outcome.status === 'error') {
+        assert.match(
+          (outcome.error as Error).message,
+          /Could not find volume path/,
+        );
+      }
+      assert.strictEqual(outcome.isSafeToCleanup, false);
+      assert.deepStrictEqual(commands, ['hdiutil attach']);
+    });
+  });
+
+  it('stops the decompressor and waits for close after a tar pipeline failure', async () => {
+    const spawn = childProcess.spawn;
+    // Keep the producer alive after emitting an invalid tar header so the
+    // output pipeline failure must stop it. The timer bounds a broken test.
+    const producer = spawn(process.execPath, [
+      '-e',
+      "process.stdin.resume(); process.stdout.write(Buffer.alloc(512, 'x')); setTimeout(() => process.exit(0), 5000);",
+    ]);
+    let closed = false;
+    const childClosed = new Promise<void>(resolve => {
+      producer.once('close', () => {
+        closed = true;
+        resolve();
+      });
+    });
+    const kill = sinon.spy(producer, 'kill');
+    const spawnStub = sinon.stub(childProcess, 'spawn').returns(producer);
+    syncBuiltinESMExports();
+    try {
+      const outcome = await unpackArchiveWithCleanupState(
+        path.join(fixturesPath, 'test.tar.xz'),
+        path.join(tmpDir, 'output'),
+      );
+
+      assert.strictEqual(outcome.status, 'error');
+      assert.ok(kill.called, 'producer was not stopped');
+      assert.ok(closed, 'extraction settled before the producer closed');
+      assert.strictEqual(outcome.isSafeToCleanup, true);
+    } finally {
+      spawnStub.restore();
+      syncBuiltinESMExports();
+      kill.restore();
+      if (!closed) {
+        producer.kill();
+      }
+      await childClosed;
+    }
   });
 
   it('rejects a non-zero decompressor after closing the archive', async () => {
