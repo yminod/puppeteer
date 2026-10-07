@@ -228,10 +228,12 @@ describe('Install with providers', () => {
 
       // All providers fail
       const provider1 = new MockProvider({
+        name: 'FirstProvider',
         supports: true,
         getDownloadUrlError: new Error('Network error'),
       });
       const provider2 = new MockProvider({
+        name: 'SecondProvider',
         supports: true,
         getDownloadUrlError: new Error('Server error'),
       });
@@ -249,11 +251,9 @@ describe('Install with providers', () => {
       } catch (error) {
         assert(error instanceof Error);
         assert(error.message.includes('All providers failed'));
-        // Verify provider names appear in error message
-        assert(error.message.includes('MockProvider'));
-        // Verify both provider errors are included
-        assert(error.message.includes('Network error'));
-        assert(error.message.includes('Server error'));
+        // Verify each provider is paired with its error.
+        assert(error.message.includes('FirstProvider: Network error'));
+        assert(error.message.includes('SecondProvider: Server error'));
       }
     });
   });

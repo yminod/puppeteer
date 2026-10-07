@@ -66,17 +66,8 @@ describe('install marker', () => {
 
   for (const [name, marker] of [
     ['non-object JSON', []],
-    ['unknown version', {version: 2, relativeExecutablePath: 'executable'}],
     ['missing executable path', {version: 1}],
     ['empty executable path', {version: 1, relativeExecutablePath: ''}],
-    [
-      'absolute executable path',
-      {version: 1, relativeExecutablePath: path.resolve('executable')},
-    ],
-    [
-      'escaping executable path',
-      {version: 1, relativeExecutablePath: path.join('..', 'executable')},
-    ],
   ] as const) {
     it(`rejects ${name}`, () => {
       writeMarker(marker);
@@ -86,6 +77,31 @@ describe('install marker', () => {
     });
   }
 
+  it('rejects unknown version', () => {
+    fs.writeFileSync(path.join(installationDir, 'executable'), '');
+    writeMarker({version: 2, relativeExecutablePath: 'executable'});
+
+    assertInvalidMarker(/unsupported marker version/);
+  });
+
+  it('rejects absolute executable path', () => {
+    const executablePath = path.join(installationDir, 'executable');
+    fs.writeFileSync(executablePath, '');
+    writeMarker({version: 1, relativeExecutablePath: executablePath});
+
+    assertInvalidMarker(/the executable path is absolute/);
+  });
+
+  it('rejects escaping executable path', () => {
+    fs.writeFileSync(path.join(tmpDir, 'executable'), '');
+    writeMarker({
+      version: 1,
+      relativeExecutablePath: path.join('..', 'executable'),
+    });
+
+    assertInvalidMarker(/the executable path escapes the installation root/);
+  });
+
   it('rejects malformed JSON', () => {
     fs.writeFileSync(markerPath(), '{');
     assert.throws(() => {
@@ -93,14 +109,12 @@ describe('install marker', () => {
     }, InvalidInstallMarkerError);
   });
 
-  it('rejects a marker symlink', () => {
+  it('rejects a non-regular marker', () => {
     const markerTarget = path.join(tmpDir, 'marker-target');
     fs.mkdirSync(markerTarget);
     fs.symlinkSync(markerTarget, markerPath(), 'junction');
 
-    assert.throws(() => {
-      readInstallMarker(installationDir);
-    }, InvalidInstallMarkerError);
+    assertInvalidMarker(/the marker is not a regular file/);
   });
 
   it('does not replace an archive-provided marker', () => {
@@ -167,6 +181,19 @@ describe('install marker', () => {
       path.join(installationDir, relativeExecutablePath),
     );
   });
+
+  function assertInvalidMarker(message: RegExp): void {
+    assert.throws(
+      () => {
+        readInstallMarker(installationDir);
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof InvalidInstallMarkerError);
+        assert.match(error.message, message);
+        return true;
+      },
+    );
+  }
 
   function markerPath(): string {
     return path.join(installationDir, INSTALL_MARKER_FILE);

@@ -48,7 +48,7 @@ export function readInstallMarker(
     }
     throw invalidMarker(markerPath, error);
   }
-  if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
+  if (!markerStat.isFile()) {
     throw invalidMarker(markerPath, 'the marker is not a regular file');
   }
 

@@ -157,6 +157,24 @@ describe('fileUtil', function () {
       fs.renameSync(archivePath, renamedPath);
     });
 
+    it('closes the archive after an entry write fails', async () => {
+      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
+      const outputPath = path.join(tmpDir, 'output');
+      const blockedFile = path.join(outputPath, 'browser', 'chrome');
+      fs.mkdirSync(blockedFile, {recursive: true});
+
+      await assert.rejects(
+        extractZipWithYauzl(path.join(fixturesPath, 'test.zip'), outputPath),
+        (error: unknown) => {
+          const {cause} = error as {cause?: NodeJS.ErrnoException};
+          assert.strictEqual(cause?.code, 'EISDIR');
+          return true;
+        },
+      );
+      assert.ok(events.calledWith('close'), 'archive was not closed');
+      assert.ok(fs.statSync(blockedFile).isDirectory());
+    });
+
     // Node.js does not honor POSIX permission bits on Windows.
     (os.platform() === 'win32' ? it.skip : it)(
       'preserves owner permissions',
@@ -414,17 +432,13 @@ describe('fileUtil', function () {
     const archivePath = path.join(tmpDir, 'input.tar.xz');
     const renamedPath = path.join(tmpDir, 'closed.tar.xz');
     const outputPath = path.join(tmpDir, 'output');
-    fs.copyFileSync(path.join(fixturesPath, 'test.tar.xz'), archivePath);
-    internalConstantsForTesting.xz = process.execPath;
-    try {
-      await assert.rejects(
-        unpackArchive(archivePath, outputPath),
-        /`xz` exited with code/,
-      );
-      fs.renameSync(archivePath, renamedPath);
-    } finally {
-      internalConstantsForTesting.xz = 'xz';
-    }
+    // xz rejects this input before producing any tar data.
+    fs.writeFileSync(archivePath, 'not an xz archive');
+    await assert.rejects(
+      unpackArchive(archivePath, outputPath),
+      /`xz` exited with code 1/,
+    );
+    fs.renameSync(archivePath, renamedPath);
   });
 
   it('throws an error if xz is not found', async () => {

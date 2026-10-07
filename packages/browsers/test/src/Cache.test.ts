@@ -9,6 +9,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import sinon from 'sinon';
+
 import {writeInstallMarker} from '../../lib/installMarker.js';
 import {Browser, BrowserPlatform, Cache} from '../../lib/main.js';
 
@@ -140,6 +142,33 @@ describe('Cache', () => {
       cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
     });
     assert.strictEqual(fs.readFileSync(metadataPath, 'utf8'), '{');
+  });
+
+  it('preserves metadata and removes the temp file when rename fails', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
+    const metadataPath = cache.metadataFile(Browser.CHROME);
+    const previousMetadata = fs.readFileSync(metadataPath);
+    const renameError = new Error('rename failed');
+    const rename = sinon.stub(fs, 'renameSync').throws(renameError);
+
+    try {
+      assert.throws(
+        () => {
+          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0');
+        },
+        error => {
+          assert.strictEqual(error, renameError);
+          return true;
+        },
+      );
+      assert.deepStrictEqual(fs.readFileSync(metadataPath), previousMetadata);
+      assert.deepStrictEqual(
+        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+        ['.metadata'],
+      );
+    } finally {
+      rename.restore();
+    }
   });
 
   it('leaves no metadata temp file after an atomic update', () => {

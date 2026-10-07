@@ -301,14 +301,6 @@ async function installWithProviders(
     })
     .join('\n');
   const message = `All providers failed for ${options.browser} ${options.buildId}:\n${errorDetails}`;
-  if (
-    errors.length > 0 &&
-    errors.every(e => {
-      return e.error instanceof IncompleteInstallationError;
-    })
-  ) {
-    throw new IncompleteInstallationError(message);
-  }
   throw new Error(message);
 }
 

@@ -144,7 +144,7 @@ describe('install', () => {
     assert.strictEqual(provider.executablePathCalls, 1);
   });
 
-  it('keeps the first completed tree when publishers race', async () => {
+  it('converges concurrent installs on a completed tree', async () => {
     const firstProvider = new TestProvider(serverUrl);
     const secondProvider = new TestProvider(serverUrl);
     const options = {
@@ -302,6 +302,8 @@ describe('install', () => {
       BrowserPlatform.LINUX,
       '123',
     );
+    const firstProvider = new TestProvider(serverUrl);
+    const secondProvider = new TestProvider(serverUrl);
 
     await assert.rejects(
       install({
@@ -309,10 +311,14 @@ describe('install', () => {
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
         buildId: '123',
-        providers: [new TestProvider(serverUrl)],
+        providers: [firstProvider, secondProvider],
         baseUrl: serverUrl.origin,
       }),
     );
+    assert.strictEqual(firstProvider.supportsCalls, 1);
+    // Fallback could fail on the same metadata, so rejection alone does not
+    // prove that the post-publication error is terminal.
+    assert.strictEqual(secondProvider.supportsCalls, 0);
     assert.strictEqual(
       fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),
       true,
@@ -478,21 +484,27 @@ describe('install', () => {
   it('cleans a failed attempt before provider fallback', async function () {
     this.timeout(30_000);
     const invalidUrl = new URL('/invalid.zip', serverUrl);
+    const stagingPath = path.join(tmpDir, Browser.CHROME, '.staging');
+    const fallbackProvider = new TestProvider(serverUrl);
+    let stagingAtFallback: string[] | undefined;
+    const supports = fallbackProvider.supports.bind(fallbackProvider);
+    fallbackProvider.supports = options => {
+      stagingAtFallback = fs.readdirSync(stagingPath);
+      return supports(options);
+    };
 
     const installedBrowser = await install({
       cacheDir: tmpDir,
       browser: Browser.CHROME,
       platform: BrowserPlatform.LINUX,
       buildId: '123',
-      providers: [new TestProvider(invalidUrl), new TestProvider(serverUrl)],
+      providers: [new TestProvider(invalidUrl), fallbackProvider],
       baseUrl: serverUrl.origin,
     });
 
+    assert.deepStrictEqual(stagingAtFallback, []);
     assert.strictEqual(fs.existsSync(installedBrowser.executablePath), true);
-    assert.deepStrictEqual(
-      fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')),
-      [],
-    );
+    assert.deepStrictEqual(fs.readdirSync(stagingPath), []);
   });
 
   it('rejects an ambiguous marker-less final and preserves it', async () => {
@@ -502,9 +514,10 @@ describe('install', () => {
       BrowserPlatform.LINUX,
       '123',
     );
-    const provider = new TestProvider(serverUrl, () => {
+    const firstProvider = new TestProvider(serverUrl, () => {
       fs.mkdirSync(installationDir, {recursive: true});
     });
+    const secondProvider = new TestProvider(serverUrl);
 
     await assert.rejects(
       install({
@@ -512,11 +525,15 @@ describe('install', () => {
         browser: Browser.CHROME,
         platform: BrowserPlatform.LINUX,
         buildId: '123',
-        providers: [provider],
+        providers: [firstProvider, secondProvider],
         baseUrl: serverUrl.origin,
       }),
       IncompleteInstallationError,
     );
+    assert.strictEqual(firstProvider.supportsCalls, 1);
+    // Fallback could report the same error type when inspecting the final,
+    // so rejection alone does not prove that the publication error is terminal.
+    assert.strictEqual(secondProvider.supportsCalls, 0);
     assert.strictEqual(fs.existsSync(installationDir), true);
     assert.strictEqual(
       fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),

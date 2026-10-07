@@ -6,8 +6,12 @@
 
 import assert from 'node:assert';
 import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+
+import sinon from 'sinon';
 
 import {writeInstallMarker} from '../../lib/installMarker.js';
 import {
@@ -95,6 +99,39 @@ describe('install staging', () => {
     assert.strictEqual(fs.existsSync(second.outputPath), true);
   });
 
+  it('preserves a valid winner discovered after rename fails', async () => {
+    const attempt = await createInstallAttempt(browserRoot);
+    const executablePath = prepareOutput(attempt.outputPath, 'candidate');
+    const installationDir = path.join(browserRoot, 'linux-123');
+    const rename = sinon.stub(fsPromises, 'rename').callsFake(async () => {
+      // Publish after the initial winner check to exercise the catch recheck.
+      prepareOutput(installationDir, 'winner');
+      throw new Error('rename failed');
+    });
+    syncBuiltinESMExports();
+
+    try {
+      assert.strictEqual(
+        await publishInstallTree(attempt.outputPath, installationDir),
+        'winner',
+      );
+      assert.ok(
+        rename.calledOnceWithExactly(attempt.outputPath, installationDir),
+      );
+      assert.strictEqual(
+        fs.readFileSync(path.join(installationDir, executablePath), 'utf8'),
+        'winner',
+      );
+      assert.strictEqual(
+        fs.readFileSync(path.join(attempt.outputPath, executablePath), 'utf8'),
+        'candidate',
+      );
+    } finally {
+      rename.restore();
+      syncBuiltinESMExports();
+    }
+  });
+
   it('rejects a marker-less directory that appears during publication', async () => {
     const attempt = await createInstallAttempt(browserRoot);
     prepareOutput(attempt.outputPath, 'candidate');
@@ -117,12 +154,15 @@ describe('install staging', () => {
 
     assert.strictEqual(fs.readFileSync(archivePath, 'utf8'), 'first');
     assert.strictEqual(fs.existsSync(attempt.archivePath), false);
-    await removeInstallAttempt(attempt.path);
   });
 
   it('uses bounded retries to remove an attempt', async () => {
     const attempt = await createInstallAttempt(browserRoot);
+    const nestedDir = path.join(attempt.outputPath, 'nested');
+    fs.mkdirSync(nestedDir, {recursive: true});
+    fs.writeFileSync(path.join(nestedDir, 'file'), 'contents');
     const originalRm = internalConstantsForTesting.rm;
+    let observedTarget: string | undefined;
     let observedOptions:
       | {
           recursive: true;
@@ -132,18 +172,21 @@ describe('install staging', () => {
         }
       | undefined;
     internalConstantsForTesting.rm = async (target, options) => {
+      observedTarget = target;
       observedOptions = options;
       await originalRm(target, options);
     };
 
     try {
       await removeInstallAttempt(attempt.path);
+      assert.strictEqual(observedTarget, attempt.path);
       assert.deepStrictEqual(observedOptions, {
         recursive: true,
         force: true,
         maxRetries: 5,
         retryDelay: 100,
       });
+      assert.strictEqual(fs.existsSync(attempt.path), false);
     } finally {
       internalConstantsForTesting.rm = originalRm;
     }

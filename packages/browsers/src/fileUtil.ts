@@ -365,61 +365,36 @@ export async function extractZipWithYauzl(
   const open = promisify<string, Options, ZipFile>(yauzl.open);
   try {
     const zipFile = await open(archivePath, {lazyEntries: true});
-    await new Promise<void>((resolve, reject) => {
-      let activeEntry: Promise<void> | undefined;
-      let closed = false;
-      let ended = false;
-      let failure: unknown;
-      let settled = false;
+    let activeEntry: Promise<void> | undefined;
+    let failed = false;
+    const archiveClosed = new Promise<void>(resolve => {
+      zipFile.once('close', resolve);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const fail = (error: unknown): void => {
+          failed = true;
+          reject(error);
+        };
 
-      const settle = (): void => {
-        if (settled || !closed || activeEntry) {
-          return;
-        }
-        if (failure) {
-          settled = true;
-          reject(failure);
-        } else if (ended) {
-          settled = true;
-          resolve();
-        }
-      };
-      const fail = (error: unknown): void => {
-        failure ??= error;
-        zipFile.close();
-        settle();
-      };
-
-      zipFile
-        .on('error', fail)
-        .on('close', () => {
-          closed = true;
-          settle();
-        })
-        .on('end', () => {
-          ended = true;
-          zipFile.close();
-          settle();
-        })
-        .on('entry', entry => {
-          activeEntry = extractZipEntry(zipFile, entry, folderPath);
-          void activeEntry.then(
-            () => {
-              activeEntry = undefined;
-              if (failure) {
-                settle();
-              } else {
+        zipFile
+          .on('error', fail)
+          .on('end', resolve)
+          .on('entry', entry => {
+            activeEntry = extractZipEntry(zipFile, entry, folderPath);
+            void activeEntry.then(() => {
+              if (!failed) {
                 zipFile.readEntry();
               }
-            },
-            error => {
-              activeEntry = undefined;
-              fail(error);
-            },
-          );
-        })
-        .readEntry();
-    });
+            }, fail);
+          })
+          .readEntry();
+      });
+    } finally {
+      zipFile.close();
+      // Archive close can precede an active entry's output completion.
+      await Promise.allSettled([activeEntry, archiveClosed]);
+    }
   } catch (error) {
     throw new Error(`Extraction failed: ${archivePath}`, {cause: error});
   }
