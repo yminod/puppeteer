@@ -14,7 +14,7 @@ import {URL, urlToHttpOptions} from 'node:url';
 
 export async function headHttpRequest(url: URL): Promise<boolean> {
   return await new Promise(resolve => {
-    httpRequest(
+    void httpRequest(
       url,
       'HEAD',
       response => {
@@ -23,15 +23,12 @@ export async function headHttpRequest(url: URL): Promise<boolean> {
         resolve(response.statusCode === 200);
       },
       false,
-    )
-      .then(request => {
-        request.on('error', () => {
-          resolve(false);
-        });
-      })
-      .catch(() => {
+      () => {
         resolve(false);
-      });
+      },
+    ).catch(() => {
+      resolve(false);
+    });
   });
 }
 
@@ -160,14 +157,23 @@ export async function downloadFile(
       {cause},
     );
   };
+  // Local failures can abort the response too; preserve their primary error.
   let firstError: unknown;
   let responseError: Error | undefined;
   const verifier = expectedHash ? new HashVerifier() : null;
   const progress = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      downloadedBytes += chunk.length;
-      verifier?.update(chunk);
-      progressCallback?.(downloadedBytes, totalBytes ?? 0);
+      try {
+        downloadedBytes += chunk.length;
+        verifier?.update(chunk);
+        progressCallback?.(downloadedBytes, totalBytes ?? 0);
+      } catch (error) {
+        const failure =
+          error instanceof Error ? error : new Error(String(error));
+        firstError ??= failure;
+        callback(failure);
+        return;
+      }
       callback(null, chunk);
     },
   });
@@ -209,36 +215,30 @@ export async function getJSON(url: URL): Promise<unknown> {
 }
 
 export function getText(url: URL): Promise<string> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const request = await httpRequest(
-        url,
-        'GET',
-        response => {
-          let data = '';
-          if (response.statusCode && response.statusCode >= 400) {
-            return reject(new Error(`Got status code ${response.statusCode}`));
+  return new Promise((resolve, reject) => {
+    void httpRequest(
+      url,
+      'GET',
+      response => {
+        let data = '';
+        if (response.statusCode && response.statusCode >= 400) {
+          return reject(new Error(`Got status code ${response.statusCode}`));
+        }
+        response.on('data', chunk => {
+          data += chunk;
+        });
+        response.on('end', () => {
+          try {
+            return resolve(String(data));
+          } catch {
+            return reject(
+              new Error(`Failed to read text response from ${url}`),
+            );
           }
-          response.on('data', chunk => {
-            data += chunk;
-          });
-          response.on('end', () => {
-            try {
-              return resolve(String(data));
-            } catch {
-              return reject(
-                new Error(`Failed to read text response from ${url}`),
-              );
-            }
-          });
-        },
-        false,
-      );
-      request.on('error', err => {
-        reject(err);
-      });
-    } catch (err) {
-      reject(err);
-    }
+        });
+      },
+      false,
+      reject,
+    ).catch(reject);
   });
 }
