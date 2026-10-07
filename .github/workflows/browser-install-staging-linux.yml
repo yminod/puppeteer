@@ -18,7 +18,7 @@ concurrency:
 env:
   CI: true
   FORCE_COLOR: 0
-  SOURCE_COMMIT: 24b4e8dee65eca4fec81c19461cbb24067a65106
+  SOURCE_COMMIT: 6c525bc1ed41075a673c48180297d15b7b0d001f
 
 jobs:
   package-tests:
@@ -41,7 +41,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: npm
-          node-version-file: '.nvmrc'
+          node-version: '24.15.0'
 
       - name: Record runner environment
         run: |
@@ -87,7 +87,7 @@ jobs:
           grep -F 'unpacks tar.xz' "$log"
           grep -F 'unpacks tar.bz2' "$log"
           grep -F 'should download a buildId that is a bzip2 archive' "$log"
-          grep -F 'keeps the first completed tree when publishers race' "$log"
+          grep -F 'converges concurrent installs on a completed tree' "$log"
 
       - name: Upload package validation evidence
         if: ${{ !cancelled() }}
@@ -118,7 +118,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: npm
-          node-version-file: '.nvmrc'
+          node-version: '24.15.0'
 
       - name: Record runner environment
         run: |
