@@ -22,6 +22,9 @@ import {readInstallMarker} from './installMarker.js';
 const METADATA_RENAME_MAX_ATTEMPTS = 5;
 const METADATA_RENAME_RETRY_DELAY = 50;
 const metadataRenameWait = new Int32Array(new SharedArrayBuffer(4));
+const METADATA_LOCK_TIMEOUT = 1000;
+const METADATA_LOCK_RETRY_DELAY = 25;
+const metadataLockWait = new Int32Array(new SharedArrayBuffer(4));
 
 /**
  * @public
@@ -71,6 +74,7 @@ export class InstalledBrowser {
   }
 
   writeMetadata(metadata: Metadata): void {
+    // This replaces the complete snapshot; a separate read is not a transaction.
     this.#cache.writeMetadata(this.browser, metadata);
   }
 }
@@ -158,23 +162,25 @@ export class Cache {
   }
 
   writeMetadata(browser: Browser, metadata: Metadata): void {
-    const metadataPath = this.metadataFile(browser);
-    fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
-    this.#writeMetadataFile(metadataPath, metadata);
+    this.#withMetadataLock(browser, () => {
+      this.#writeMetadataFile(this.metadataFile(browser), metadata);
+    });
   }
 
   updateMetadata(
     browser: Browser,
     mutator: (metadata: Metadata) => void,
   ): boolean {
-    const metadata = this.readMetadata(browser);
-    const previous = JSON.stringify(metadata);
-    mutator(metadata);
-    if (JSON.stringify(metadata) === previous) {
-      return false;
-    }
-    this.writeMetadata(browser, metadata);
-    return true;
+    return this.#withMetadataLock(browser, () => {
+      const metadata = this.readMetadata(browser);
+      const previous = JSON.stringify(metadata);
+      mutator(metadata);
+      if (JSON.stringify(metadata) === previous) {
+        return false;
+      }
+      this.#writeMetadataFile(this.metadataFile(browser), metadata);
+      return true;
+    });
   }
 
   readExecutablePath(
@@ -251,18 +257,14 @@ export class Cache {
     platform: BrowserPlatform,
     buildId: string,
   ): void {
-    const metadata = this.readMetadata(browser);
-    for (const alias of Object.keys(metadata.aliases)) {
-      if (metadata.aliases[alias] === buildId) {
-        delete metadata.aliases[alias];
+    this.updateMetadata(browser, metadata => {
+      for (const alias of Object.keys(metadata.aliases)) {
+        if (metadata.aliases[alias] === buildId) {
+          delete metadata.aliases[alias];
+        }
       }
-    }
-    // Clean up executable path entry
-    const key = `${platform}-${buildId}`;
-    if (metadata.executablePaths?.[key]) {
-      delete metadata.executablePaths[key];
-      this.writeMetadata(browser, metadata);
-    }
+      delete metadata.executablePaths?.[`${platform}-${buildId}`];
+    });
     fs.rmSync(this.installationDir(browser, platform, buildId), {
       force: true,
       recursive: true,
@@ -343,6 +345,53 @@ export class Cache {
         options.buildId,
       ),
     );
+  }
+
+  #withMetadataLock<T>(browser: Browser, task: () => T): T {
+    const browserRoot = this.browserRoot(browser);
+    fs.mkdirSync(browserRoot, {recursive: true});
+    const lockPath = path.join(browserRoot, '.metadata.lock');
+    const deadline = performance.now() + METADATA_LOCK_TIMEOUT;
+    for (;;) {
+      try {
+        fs.mkdirSync(lockPath);
+        break;
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          !('code' in error) ||
+          error.code !== 'EEXIST'
+        ) {
+          throw error;
+        }
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) {
+          throw new Error(
+            `Timed out waiting for metadata lock ${lockPath}. ` +
+              'The lock is not automatically reclaimed. Stop all cache writers before removing it.',
+            {cause: error},
+          );
+        }
+        Atomics.wait(
+          metadataLockWait,
+          0,
+          0,
+          Math.min(METADATA_LOCK_RETRY_DELAY, remaining),
+        );
+      }
+    }
+    try {
+      return task();
+    } finally {
+      try {
+        fs.rmdirSync(lockPath);
+      } catch (error) {
+        // Preserve the update result/error. A retained guard blocks later writes.
+        this.#logger?.(
+          `Failed to release metadata lock ${lockPath}: ${(error as Error).message}`,
+        );
+      }
+    }
   }
 
   #writeMetadataFile(metadataPath: string, metadata: Metadata): void {

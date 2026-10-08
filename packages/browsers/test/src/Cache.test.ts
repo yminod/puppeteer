@@ -142,6 +142,162 @@ describe('Cache', () => {
       cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
     });
     assert.strictEqual(fs.readFileSync(metadataPath, 'utf8'), '{');
+    assert.deepStrictEqual(fs.readdirSync(cache.browserRoot(Browser.CHROME)), [
+      '.metadata',
+    ]);
+  });
+
+  it('releases the metadata lock after a mutator throws', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123');
+    const lockPath = path.join(
+      cache.browserRoot(Browser.CHROME),
+      '.metadata.lock',
+    );
+    const failure = new Error('mutator failed');
+    assert.throws(
+      () => {
+        cache.updateMetadata(Browser.CHROME, metadata => {
+          assert.ok(fs.existsSync(lockPath));
+          metadata.aliases['stable'] = '456';
+          throw failure;
+        });
+      },
+      error => {
+        return error === failure;
+      },
+    );
+    assert.ok(!fs.existsSync(lockPath));
+    assert.equal(cache.resolveAlias(Browser.CHROME, 'stable'), '123');
+    cache.writeAlias(Browser.CHROME, 'canary', '456');
+  });
+
+  it('releases a no-op update without replacing metadata', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123');
+    const rename = sinon.spy(fs, 'renameSync');
+    try {
+      assert.equal(
+        cache.updateMetadata(Browser.CHROME, metadata => {
+          metadata.aliases['stable'] = '123';
+        }),
+        false,
+      );
+      assert.equal(rename.callCount, 0);
+      assert.deepStrictEqual(
+        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+        ['.metadata'],
+      );
+    } finally {
+      rename.restore();
+    }
+  });
+
+  it('does not enter or remove another writer lock after timing out', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123');
+    const lockPath = path.join(
+      cache.browserRoot(Browser.CHROME),
+      '.metadata.lock',
+    );
+    fs.mkdirSync(lockPath);
+    const read = sinon.spy(cache, 'readMetadata');
+    const clock = sinon.stub(performance, 'now');
+    clock.onFirstCall().returns(0);
+    clock.returns(1000);
+    try {
+      assert.throws(
+        () => {
+          cache.writeAlias(Browser.CHROME, 'canary', '456');
+        },
+        error => {
+          return (
+            error instanceof Error &&
+            error.message.includes(lockPath) &&
+            error.message.includes('not automatically reclaimed')
+          );
+        },
+      );
+      assert.equal(read.callCount, 0);
+      assert.ok(fs.existsSync(lockPath));
+    } finally {
+      read.restore();
+      clock.restore();
+      fs.rmdirSync(lockPath);
+    }
+    assert.deepStrictEqual(cache.readMetadata(Browser.CHROME), {
+      aliases: {stable: '123'},
+    });
+  });
+
+  it('propagates acquisition errors without attempting to release an unowned lock', () => {
+    const lockPath = path.join(
+      cache.browserRoot(Browser.CHROME),
+      '.metadata.lock',
+    );
+    const failure = Object.assign(new Error('permission denied'), {
+      code: 'EACCES',
+    });
+    const mkdirSync = fs.mkdirSync;
+    const mkdir = sinon.stub(fs, 'mkdirSync').callsFake((target, options) => {
+      if (String(target) === lockPath) {
+        throw failure;
+      }
+      return mkdirSync(target, options);
+    });
+    const release = sinon.spy(fs, 'rmdirSync');
+    try {
+      assert.throws(
+        () => {
+          cache.writeAlias(Browser.CHROME, 'stable', '123');
+        },
+        error => {
+          return error === failure;
+        },
+      );
+      assert.equal(release.callCount, 0);
+    } finally {
+      mkdir.restore();
+      release.restore();
+    }
+  });
+
+  for (const success of [true, false]) {
+    it(`preserves the ${success ? 'result' : 'original error'} when lock cleanup fails`, () => {
+      const failure = new Error('mutator failed');
+      const cleanupError = new Error('lock cleanup failed');
+      const release = sinon.stub(fs, 'rmdirSync').throws(cleanupError);
+      try {
+        const task = () => {
+          return cache.updateMetadata(Browser.CHROME, metadata => {
+            if (!success) {
+              throw failure;
+            }
+            metadata.aliases['stable'] = '123';
+          });
+        };
+        if (success) {
+          assert.equal(task(), true);
+        } else {
+          assert.throws(task, error => {
+            return error === failure;
+          });
+        }
+        assert.ok(
+          fs.existsSync(
+            path.join(cache.browserRoot(Browser.CHROME), '.metadata.lock'),
+          ),
+        );
+      } finally {
+        release.restore();
+      }
+    });
+  }
+
+  it('removes aliases during uninstall even without an executable-path override', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123');
+    cache.writeAlias(Browser.CHROME, 'canary', '456');
+    cache.uninstall(Browser.CHROME, BrowserPlatform.WIN64, '123');
+    assert.deepStrictEqual(cache.readMetadata(Browser.CHROME), {
+      aliases: {canary: '456'},
+    });
   });
 
   it('preserves metadata and removes the temp file when rename fails', () => {
