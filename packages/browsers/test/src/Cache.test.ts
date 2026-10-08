@@ -178,4 +178,159 @@ describe('Cache', () => {
       '.metadata',
     ]);
   });
+
+  for (const code of ['EPERM', 'EBUSY', 'EACCES']) {
+    it(`retries transient ${code} while replacing metadata on Windows`, () => {
+      cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
+      const metadataPath = cache.metadataFile(Browser.CHROME);
+      const previousMetadata = fs.readFileSync(metadataPath);
+      const renameSync = fs.renameSync;
+      const renameError = Object.assign(new Error('rename contention'), {code});
+      const sandbox = sinon.createSandbox();
+      try {
+        sandbox.stub(process, 'platform').value('win32');
+        const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
+        const rename = sandbox.stub(fs, 'renameSync').callsFake((from, to) => {
+          assert.ok(fs.existsSync(from));
+          assert.deepStrictEqual(fs.readFileSync(to), previousMetadata);
+          if (rename.callCount < 3) {
+            throw renameError;
+          }
+          renameSync(from, to);
+        });
+
+        assert.strictEqual(
+          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0'),
+          undefined,
+        );
+        assert.strictEqual(rename.callCount, 3);
+        assert.deepStrictEqual(rename.secondCall.args, rename.firstCall.args);
+        assert.deepStrictEqual(rename.thirdCall.args, rename.firstCall.args);
+        assert.deepStrictEqual(
+          wait.getCalls().map(call => {
+            return call.args[3];
+          }),
+          [50, 100],
+        );
+        assert.strictEqual(
+          cache.readMetadata(Browser.CHROME).aliases['stable'],
+          '124.0.0.0',
+        );
+        assert.deepStrictEqual(
+          fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+          ['.metadata'],
+        );
+      } finally {
+        sandbox.restore();
+      }
+    });
+  }
+
+  it('bounds Windows rename retries and preserves the last error and metadata', () => {
+    cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
+    const metadataPath = cache.metadataFile(Browser.CHROME);
+    const previousMetadata = fs.readFileSync(metadataPath);
+    const errors = Array.from({length: 5}, (_, index) => {
+      return Object.assign(new Error(`rename failure ${index}`), {
+        code: 'EPERM',
+      });
+    });
+    const sandbox = sinon.createSandbox();
+    try {
+      sandbox.stub(process, 'platform').value('win32');
+      const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
+      const rename = sandbox.stub(fs, 'renameSync').callsFake((from, to) => {
+        assert.ok(fs.existsSync(from));
+        assert.deepStrictEqual(fs.readFileSync(to), previousMetadata);
+        throw errors[rename.callCount - 1];
+      });
+
+      assert.throws(
+        () => {
+          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0');
+        },
+        error => {
+          assert.strictEqual(error, errors[4]);
+          return true;
+        },
+      );
+      assert.strictEqual(rename.callCount, 5);
+      assert.deepStrictEqual(
+        wait.getCalls().map(call => {
+          return call.args[3];
+        }),
+        [50, 100, 150, 200],
+      );
+      assert.ok(
+        rename.getCalls().every(call => {
+          return call.args[0] === rename.firstCall.args[0];
+        }),
+      );
+      assert.deepStrictEqual(fs.readFileSync(metadataPath), previousMetadata);
+      assert.deepStrictEqual(
+        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+        ['.metadata'],
+      );
+    } finally {
+      sandbox.restore();
+    }
+  });
+
+  it('does not retry other Windows rename errors', () => {
+    const sandbox = sinon.createSandbox();
+    const renameError = Object.assign(new Error('I/O failure'), {code: 'EIO'});
+    try {
+      sandbox.stub(process, 'platform').value('win32');
+      const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
+      const rename = sandbox.stub(fs, 'renameSync').throws(renameError);
+      assert.throws(
+        () => {
+          cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
+        },
+        error => {
+          assert.strictEqual(error, renameError);
+          return true;
+        },
+      );
+      assert.strictEqual(rename.callCount, 1);
+      assert.strictEqual(wait.callCount, 0);
+      assert.deepStrictEqual(
+        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+        [],
+      );
+    } finally {
+      sandbox.restore();
+    }
+  });
+
+  for (const platform of ['linux', 'darwin']) {
+    it(`does not retry metadata rename errors on ${platform}`, () => {
+      const sandbox = sinon.createSandbox();
+      const renameError = Object.assign(new Error('rename denied'), {
+        code: 'EPERM',
+      });
+      try {
+        sandbox.stub(process, 'platform').value(platform);
+        const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
+        const rename = sandbox.stub(fs, 'renameSync').throws(renameError);
+        assert.throws(
+          () => {
+            cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
+          },
+          error => {
+            assert.strictEqual(error, renameError);
+            return true;
+          },
+        );
+        assert.strictEqual(rename.callCount, 1);
+        assert.strictEqual(wait.callCount, 0);
+        assert.deepStrictEqual(
+          fs.readdirSync(cache.browserRoot(Browser.CHROME)),
+          [],
+        );
+      } finally {
+        sandbox.restore();
+      }
+    });
+  }
 });

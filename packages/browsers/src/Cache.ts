@@ -19,6 +19,10 @@ import {DEBUG_PREFIXES, type Logger} from './debug.js';
 import {detectBrowserPlatform} from './detectPlatform.js';
 import {readInstallMarker} from './installMarker.js';
 
+const METADATA_RENAME_MAX_ATTEMPTS = 5;
+const METADATA_RENAME_RETRY_DELAY = 50;
+const metadataRenameWait = new Int32Array(new SharedArrayBuffer(4));
+
 /**
  * @public
  */
@@ -350,7 +354,33 @@ export class Cache {
       fs.writeFileSync(temporaryPath, JSON.stringify(metadata, null, 2), {
         flag: 'wx',
       });
-      fs.renameSync(temporaryPath, metadataPath);
+      for (let attempt = 1; ; attempt++) {
+        try {
+          fs.renameSync(temporaryPath, metadataPath);
+          break;
+        } catch (error) {
+          if (
+            process.platform !== 'win32' ||
+            attempt >= METADATA_RENAME_MAX_ATTEMPTS ||
+            !(error instanceof Error) ||
+            !('code' in error) ||
+            !(
+              error.code === 'EPERM' ||
+              error.code === 'EBUSY' ||
+              error.code === 'EACCES'
+            )
+          ) {
+            throw error;
+          }
+          // Bound the wait while preserving the synchronous metadata API.
+          Atomics.wait(
+            metadataRenameWait,
+            0,
+            0,
+            attempt * METADATA_RENAME_RETRY_DELAY,
+          );
+        }
+      }
     } finally {
       try {
         fs.rmSync(temporaryPath, {force: true});
