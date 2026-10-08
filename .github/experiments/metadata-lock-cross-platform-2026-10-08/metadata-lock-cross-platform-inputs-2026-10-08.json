@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "base": "d5aecba927fb3c8a06962dace07dd855f18441ec",
+  "sourceBranch": "experiment/browser-metadata-lock-windows-2026-10-08",
+  "baseline": {
+    "commit": "1703cc799c1d61001b948fd6cd8b477facc6b3f3",
+    "files": [
+      {
+        "file": "packages/browsers/src/Cache.ts",
+        "windowsSha256": "00b89a9cf4081452e769924d6e099da6fd86492324b1545281e758e6c81aea02",
+        "normalizedSha256": "00b89a9cf4081452e769924d6e099da6fd86492324b1545281e758e6c81aea02"
+      },
+      {
+        "file": "packages/browsers/test/src/Cache.test.ts",
+        "windowsSha256": "a82914bf2507c4c01c1aabbe4e0d967831f032bbedd4c17d25c552fb2daaa095",
+        "normalizedSha256": "a82914bf2507c4c01c1aabbe4e0d967831f032bbedd4c17d25c552fb2daaa095"
+      },
+      {
+        "file": "packages/browsers/lib/Cache.js",
+        "windowsSha256": "71f8b6378baf738193d82d090de15305726bbcab906ae3954fe102b6009bf24c",
+        "normalizedSha256": "71f8b6378baf738193d82d090de15305726bbcab906ae3954fe102b6009bf24c"
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "944cdef2d6a3bf7b40a55e2ea4a18c5d76beb069",
+    "files": [
+      {
+        "file": "packages/browsers/src/Cache.ts",
+        "windowsSha256": "7122c6b244aaea7b4a9c616c462ea86685447d4a86c17a4443a74dfe5511736e",
+        "normalizedSha256": "7122c6b244aaea7b4a9c616c462ea86685447d4a86c17a4443a74dfe5511736e"
+      },
+      {
+        "file": "packages/browsers/test/src/Cache.test.ts",
+        "windowsSha256": "adba2e60e5893d4de654bba9b581d23da0194f8560415a11210810a5f1bbe304",
+        "normalizedSha256": "adba2e60e5893d4de654bba9b581d23da0194f8560415a11210810a5f1bbe304"
+      },
+      {
+        "file": "packages/browsers/lib/Cache.js",
+        "windowsSha256": "fdaaf960a7a73ea3fabd1c86e7253557ef6b2dbef53a1794e75596fd66e103ea",
+        "normalizedSha256": "fdaaf960a7a73ea3fabd1c86e7253557ef6b2dbef53a1794e75596fd66e103ea"
+      }
+    ]
+  },
+  "note": "Commit fields are filled after committing the byte-identical WI2/WI3 source as two commits. Canonical LF hashes tolerate checkout line endings; compiled Cache must match after independent build. Windows legacy baseline at base with only these two dirty Cache files is accepted when it has identical hashes."
+}

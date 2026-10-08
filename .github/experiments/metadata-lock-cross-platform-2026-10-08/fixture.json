@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "transportBase": "944cdef2d6a3bf7b40a55e2ea4a18c5d76beb069",
+  "experimentBranch": "experiment/browser-metadata-lock-linux-2026-10-08",
+  "node": "v24.15.0",
+  "npm": "11.12.1",
+  "sourceEvidence": "WI3/MM1",
+  "frozenFiles": [
+    {
+      "path": ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-2026-10-08.mjs",
+      "sha256": "35e2c755b40965a3961c2549dbe7b0872027a065ecdc6630b6901453bf2b8df0"
+    },
+    {
+      "path": ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-worker-2026-10-08.mjs",
+      "sha256": "3a14523eb2d132e1ac6ae2a3c4b712b2a06b7896919237191cbb1f26a74663d8"
+    },
+    {
+      "path": ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-inputs-2026-10-08.json",
+      "sha256": "b31ab400b1988a9a831e67fa405ccf859f2bacb5b9cbcfaaa005f1022081d0a7"
+    },
+    {
+      "path": ".github/experiments/metadata-lock-cross-platform-2026-10-08/staging-lock-integration-2026-10-08.mjs",
+      "sha256": "cb00124fb8cf4060625c66e98213d0c9e97e520ac5d414abdc7011a6b313cdec"
+    },
+    {
+      "path": ".github/experiments/metadata-lock-cross-platform-2026-10-08/staging-lock-integration-worker-2026-10-08.mjs",
+      "sha256": "24987b935ee0543526da1570bc19093758065178756c231a69fd3a45e5146745"
+    }
+  ],
+  "transportFiles": [
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/fixture.json",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-2026-10-08.mjs",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-inputs-2026-10-08.json",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/metadata-lock-cross-platform-worker-2026-10-08.mjs",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/run-validation.mjs",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/staging-lock-integration-2026-10-08.mjs",
+    ".github/experiments/metadata-lock-cross-platform-2026-10-08/staging-lock-integration-worker-2026-10-08.mjs",
+    ".github/workflows/browser-metadata-lock-linux.yml"
+  ],
+  "expectedFocusedCases": [
+    "retry-only-different-builds-0",
+    "retry-only-different-builds-1",
+    "retry-only-different-builds-2",
+    "retry-only-different-builds-3",
+    "retry-only-different-builds-4",
+    "retry-only-different-builds-5",
+    "retry-only-different-builds-6",
+    "retry-only-different-builds-7",
+    "retry-only-different-builds-8",
+    "retry-only-different-builds-9",
+    "dir-lock-different-builds-0",
+    "dir-lock-different-builds-1",
+    "dir-lock-different-builds-2",
+    "dir-lock-different-builds-3",
+    "dir-lock-different-builds-4",
+    "dir-lock-different-builds-5",
+    "dir-lock-different-builds-6",
+    "dir-lock-different-builds-7",
+    "dir-lock-different-builds-8",
+    "dir-lock-different-builds-9",
+    "different-aliases",
+    "uninstall-versus-alias",
+    "public-snapshot-write-participates-but-replaces",
+    "live-owner-timeout-without-takeover",
+    "kill-read",
+    "kill-beforeRename",
+    "kill-beforeRelease",
+    "ordinary-mutator-error-releases"
+  ],
+  "expectedCases": {
+    "none": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "PERF",
+      "DISCOVERY"
+    ],
+    "baseline": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "C1",
+      "C1.helper",
+      "PERF",
+      "DISCOVERY"
+    ],
+    "negative-control": ["C5"],
+    "generation": [
+      "C0.same",
+      "C0.separate",
+      "C0.archive",
+      "C0.default",
+      "C0.fallback",
+      "C1",
+      "C1.helper",
+      "C2.foreign",
+      "C3.empty",
+      "C3.malformed",
+      "C3.missing",
+      "C3.freshened",
+      "C3.initial",
+      "C4.renameRace",
+      "C4",
+      "C5",
+      "C6.initial",
+      "C6.refresh",
+      "C6.release",
+      "C6.primary",
+      "C7.archive",
+      "C7.download",
+      "C7.postPublication",
+      "15318.empty",
+      "15318.missing-executable",
+      "15318.invalid-marker",
+      "PERF",
+      "DISCOVERY"
+    ]
+  },
+  "upstreamDiscoveryCommit": "c91da4f32ceffed3696334376aabcd1a1c19d41e",
+  "expectedLinuxPackage": {
+    "passing": 217,
+    "pending": 1,
+    "failing": 0
+  },
+  "packageLogChecks": [
+    "installLock generation experiment",
+    "installLockBaseline",
+    "unpacks tar.xz",
+    "unpacks tar.bz2",
+    "should download a buildId that is a bzip2 archive",
+    "converges concurrent installs on a completed tree",
+    "should launch a Chrome browser",
+    "should launch a Firefox browser"
+  ]
+}

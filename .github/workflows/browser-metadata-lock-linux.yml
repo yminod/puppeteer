@@ -1,0 +1,189 @@
+name: Browser metadata guard Linux validation
+
+# CI transport only. Test the unchanged canonical WI2/WI3 commits in fresh trees.
+on:
+  push:
+    branches:
+      - experiment/browser-metadata-lock-linux-2026-10-08
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: browser-metadata-lock-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  FORCE_COLOR: 0
+  PUPPETEER_SKIP_DOWNLOAD: true
+  BASELINE_COMMIT: 1703cc799c1d61001b948fd6cd8b477facc6b3f3
+  CANDIDATE_COMMIT: 944cdef2d6a3bf7b40a55e2ea4a18c5d76beb069
+  VALIDATION_RUNNER: .github/experiments/metadata-lock-cross-platform-2026-10-08/run-validation.mjs
+
+jobs:
+  metadata-integration:
+    name: Metadata contention, faults, and staging-lock comparisons
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the exact CI transport commit and source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the validated Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: '24.15.0'
+
+      - name: Pin npm and create fresh canonical worktrees
+        run: |
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          git worktree add --detach "$RUNNER_TEMP/metadata-baseline" "$BASELINE_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/metadata-candidate" "$CANDIDATE_COMMIT"
+          mkdir -p "$RUNNER_TEMP/metadata-linux-integration"
+
+      - name: Record the Linux environment and verify source inputs
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-linux-integration"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            node --version
+            npm --version
+            git rev-parse HEAD
+            id
+            findmnt -T "$GITHUB_WORKSPACE"
+            findmnt -T "$artifact_dir"
+          } | tee "$artifact_dir/environment.log"
+          node "$VALIDATION_RUNNER" verify --require-linux-ext4 \
+            --baseline="$RUNNER_TEMP/metadata-baseline" \
+            --candidate="$RUNNER_TEMP/metadata-candidate" --output="$artifact_dir"
+
+      - name: Independently install and build both source inputs
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-linux-integration"
+          for role in baseline candidate; do
+            (
+              cd "$RUNNER_TEMP/metadata-$role"
+              npm ci --no-audit --no-fund 2>&1 | tee "$artifact_dir/npm-ci-$role.log"
+              npm run build --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build-$role.log"
+            )
+          done
+
+      - name: Run the unchanged focused and integration cases and artifact audits
+        run: |
+          node "$VALIDATION_RUNNER" validate --require-linux-ext4 --built=baseline,candidate \
+            --baseline="$RUNNER_TEMP/metadata-baseline" \
+            --candidate="$RUNNER_TEMP/metadata-candidate" \
+            --output="$RUNNER_TEMP/metadata-linux-integration" \
+            2>&1 | tee "$RUNNER_TEMP/metadata-linux-integration/validation.log"
+
+      - name: Upload all evidence including failures and hidden cache artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metadata-linux-integration
+          path: ${{ runner.temp }}/metadata-linux-integration
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+  package-tests:
+    name: Full browser package and native Linux extractor regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact CI transport commit and source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the validated Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: '24.15.0'
+
+      - name: Pin npm and create fresh canonical worktrees
+        run: |
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          git worktree add --detach "$RUNNER_TEMP/metadata-baseline" "$BASELINE_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/metadata-candidate" "$CANDIDATE_COMMIT"
+          mkdir -p "$RUNNER_TEMP/metadata-linux-package"
+
+      - name: Record the Linux environment and verify source inputs
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-linux-package"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            node --version
+            npm --version
+            git rev-parse HEAD
+            id
+            findmnt -T "$GITHUB_WORKSPACE"
+            findmnt -T "$artifact_dir"
+            xz --version | sed -n '1p'
+            bzip2 --version 2>&1 | sed -n '1p'
+            tar --version | sed -n '1p'
+          } | tee "$artifact_dir/environment.log"
+          node "$VALIDATION_RUNNER" verify --require-linux-ext4 \
+            --baseline="$RUNNER_TEMP/metadata-baseline" \
+            --candidate="$RUNNER_TEMP/metadata-candidate" --output="$artifact_dir"
+
+      - name: Allow browser sandbox user namespaces
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+
+      - name: Independently install and build the candidate package and tests
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-linux-package"
+          cd "$RUNNER_TEMP/metadata-candidate"
+          npm ci --no-audit --no-fund 2>&1 | tee "$artifact_dir/npm-ci.log"
+          npm run build --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build.log"
+          npm run build:test --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build-test.log"
+
+      - name: Verify the independently compiled Cache hash
+        run: |
+          node "$VALIDATION_RUNNER" verify --require-linux-ext4 --built=candidate \
+            --baseline="$RUNNER_TEMP/metadata-baseline" \
+            --candidate="$RUNNER_TEMP/metadata-candidate" \
+            --output="$RUNNER_TEMP/metadata-linux-package"
+
+      - name: Run the full browser package without skips or filters
+        id: package
+        run: |
+          cd "$RUNNER_TEMP/metadata-candidate"
+          npm test --workspace @puppeteer/browsers \
+            2>&1 | tee "$RUNNER_TEMP/metadata-linux-package/package-test.log"
+
+      - name: Audit full counts, both lock suites, native extractors, and source freeze
+        if: ${{ !cancelled() && steps.package.outcome != 'skipped' }}
+        run: |
+          node "$VALIDATION_RUNNER" package-audit --require-linux-ext4 --built=candidate \
+            --baseline="$RUNNER_TEMP/metadata-baseline" \
+            --candidate="$RUNNER_TEMP/metadata-candidate" \
+            --output="$RUNNER_TEMP/metadata-linux-package" \
+            --log="$RUNNER_TEMP/metadata-linux-package/package-test.log"
+
+      - name: Upload all package evidence including failures
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metadata-linux-package
+          path: ${{ runner.temp }}/metadata-linux-package
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
