@@ -100,6 +100,15 @@ jobs:
           node "$evidence_dir/as-run/native.mjs" "$evidence_dir/native" "$RUNNER_TEMP/metadata-token-source" \
             2>&1 | tee "$evidence_dir/native.log"
 
+      - name: Allow browser sandbox user namespaces on the disposable runner
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' }}
+        run: |
+          {
+            cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            unshare --user --map-root-user id
+          } 2>&1 | tee "$RUNNER_TEMP/metadata-token-evidence/userns.log"
+
       - name: Run the full browsers package including real extractors and launch
         if: ${{ !cancelled() && steps.inputs.outcome == 'success' }}
         run: |
