@@ -1,0 +1,115 @@
+{
+  "baseCommit": "6c525bc1ed41075a673c48180297d15b7b0d001f",
+  "patchSha256": "7847ee2da38c43ecd0cdcec89bd0dcd47a540690227ef043d5972b91ae72f6c5",
+  "sourceFiles": [
+    {
+      "file": "packages/browsers/src/Cache.ts",
+      "bytes": 10714,
+      "lines": 411,
+      "sha256": "e60c903212f535a5b1cf7ea689dbd81a11e69fa623b097eb6b712e7ec9fa7aac"
+    },
+    {
+      "file": "packages/browsers/src/metadataLock.ts",
+      "bytes": 5080,
+      "lines": 174,
+      "sha256": "251578949c8e9e663d1886cac3e2e561cfe0bd2ca14e774ee23b1d15eb0ef391"
+    },
+    {
+      "file": "packages/browsers/test/src/Cache.test.ts",
+      "bytes": 15922,
+      "lines": 512,
+      "sha256": "d0ed9cc77a1e9d556a8b36d55fad09593691e97e1e4004732300845d584aa807"
+    },
+    {
+      "file": "packages/browsers/test/src/metadataLock.test.ts",
+      "bytes": 13168,
+      "lines": 421,
+      "sha256": "0fe7ce5e364adc0ef7f91d2ae5017be5d62087e1f0bb449c6a9fa1e75d55fc66"
+    },
+    {
+      "file": "packages/browsers/test/src/fixtures/metadataWriter.ts",
+      "bytes": 979,
+      "lines": 33,
+      "sha256": "aa8b4b70228d4fff485b4e616d42d499450440b5d9a148fd8b1ae4871f44788a"
+    }
+  ],
+  "compiledFiles": [
+    {
+      "file": "packages/browsers/lib/Cache.js",
+      "bytes": 9712,
+      "sha256": "5b11ab402e83b81fd3eb58cb5748a76be85f7d2bee03efba28a58bbd33f2caa8"
+    },
+    {
+      "file": "packages/browsers/lib/metadataLock.js",
+      "bytes": 5561,
+      "sha256": "9de749116971dffb0e660f413f1b62b69aaf0b8b1b16077f822ba8d5a0f5c887"
+    }
+  ],
+  "focusedCaseNames": [
+    "Cache return empty metadata if .metadata file does not exist",
+    "Cache throw an error if .metadata is malformed",
+    "Cache writes and reads .metadata",
+    "Cache resolves latest",
+    "Cache prefers the executable path from the install marker",
+    "Cache does not fall back when the install marker is invalid",
+    "Cache does not overwrite malformed global metadata during an update",
+    "Cache releases the metadata lock after a mutator throws",
+    "Cache releases a no-op update without replacing metadata",
+    "Cache does not enter or remove another writer lock after timing out",
+    "Cache propagates acquisition errors without attempting to release an unowned lock",
+    "Cache preserves the result when lock cleanup fails",
+    "Cache preserves the original error when lock cleanup fails",
+    "Cache removes aliases during uninstall even without an executable-path override",
+    "Cache preserves metadata and removes the temp file when rename fails",
+    "Cache leaves no metadata temp file after an atomic update",
+    "Cache retries transient EPERM while replacing metadata on Windows",
+    "Cache retries transient EBUSY while replacing metadata on Windows",
+    "Cache retries transient EACCES while replacing metadata on Windows",
+    "Cache bounds Windows rename retries and preserves the last error and metadata",
+    "Cache does not retry other Windows rename errors",
+    "Cache does not retry metadata rename errors on linux",
+    "Cache does not retry metadata rename errors on darwin",
+    "metadata lock publishes a complete owner record before entering the task",
+    "metadata lock recovers an unchanged token guard after the grace period",
+    "metadata lock recovers an unchanged empty guard after the grace period",
+    "metadata lock restarts the grace period when the observed owner changes",
+    "metadata lock bounds total waiting despite continuously changing owners",
+    "metadata lock preserves an unrecognized guard (version) and does not enter the task",
+    "metadata lock preserves an unrecognized guard (json) and does not enter the task",
+    "metadata lock preserves an unrecognized guard (file) and does not enter the task",
+    "metadata lock preserves an unrecognized guard (symlink) and does not enter the task",
+    "metadata lock preserves an unrecognized guard (contents) and does not enter the task",
+    "metadata lock retries a contention rename error when the competing guard has already disappeared",
+    "metadata lock does not turn an unconfirmed permission error into contention",
+    "metadata lock leaves the successor guard untouched when an old owner finally releases",
+    "metadata lock does not remove a successor published between marker unlink and directory removal",
+    "metadata lock does not let a stale reaper delete a successor after another reaper removed the old marker",
+    "metadata lock removes a failed private preparation without replacing the primary error",
+    "metadata lock preserves distinct aliases from two real concurrent Cache writers",
+    "metadata lock recovers an interrupted writer directly from the install cache-hit path"
+  ],
+  "nativeCaseNames": [
+    "N0.native-directory-collision",
+    "N1.sigint-alias-recovery",
+    "N2.sigint-direct-cache-hit",
+    "N3.concurrent-rmw"
+  ],
+  "harnesses": [
+    {
+      "file": "native.mjs",
+      "sha256": "8e1b5a2cabc0b636e55977f1bbd2d658f5644998ca9e8ad3ce1f3d24bf3aa681"
+    },
+    {
+      "file": "verify.mjs",
+      "sha256": "e94fcfa8c04949c7b4d230cc469fac0a29337c0a5887626126f437816da6050c"
+    }
+  ],
+  "transportPaths": [
+    ".github/experiments/metadata-token-linux-2026-10-12/candidate.patch",
+    ".github/experiments/metadata-token-linux-2026-10-12/manifest.json",
+    ".github/experiments/metadata-token-linux-2026-10-12/native.mjs",
+    ".github/experiments/metadata-token-linux-2026-10-12/verify.mjs",
+    ".github/workflows/browser-metadata-token-linux.yml",
+    ".github/experiments/metadata-token-linux-2026-10-12/.gitattributes"
+  ]
+}
