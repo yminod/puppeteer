@@ -1,0 +1,51 @@
+{
+  "source": {
+    "commit": "944cdef2d6a3bf7b40a55e2ea4a18c5d76beb069",
+    "files": [
+      {
+        "file": "packages/browsers/src/Cache.ts",
+        "sha256": "7122c6b244aaea7b4a9c616c462ea86685447d4a86c17a4443a74dfe5511736e"
+      },
+      {
+        "file": "packages/browsers/test/src/Cache.test.ts",
+        "sha256": "adba2e60e5893d4de654bba9b581d23da0194f8560415a11210810a5f1bbe304"
+      },
+      {
+        "file": "packages/browsers/lib/Cache.js",
+        "sha256": "fdaaf960a7a73ea3fabd1c86e7253557ef6b2dbef53a1794e75596fd66e103ea"
+      }
+    ]
+  },
+  "harnesses": [
+    {
+      "file": "metadata-token-recovery-posix-2026-10-12.mjs",
+      "sha256": "8c5ac1b41bc771c68747f384d3a45f42fabb862306d5b418b397a94b2be6057a"
+    },
+    {
+      "file": "metadata-sigint-posix-2026-10-12.mjs",
+      "sha256": "23a7169ea46daceb9a6554e3492522050b6b197ecff1c91a350fb7c089bfc137"
+    },
+    {
+      "file": "metadata-token-recovery-model-2026-10-09.mjs",
+      "sha256": "78a60dbf7ab29a791035e72bf54cae3e1a92f7962a2718b3e841720943adaa9b"
+    },
+    {
+      "file": "metadata-token-recovery-worker-2026-10-09.mjs",
+      "sha256": "4f86b61a304e8d8612cf53dfdba51180187cf079701b4a8c260c7b0fd62a10bb"
+    },
+    {
+      "file": "metadata-sigint-worker-2026-10-09.mjs",
+      "sha256": "9a1f587c9664214511965128f79ea7a428d0b3e524e059799b6c79c320cc3966"
+    }
+  ],
+  "transportPaths": [
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-recovery-posix-audit-2026-10-12.mjs",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-recovery-posix-inputs-2026-10-12.json",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-sigint-posix-2026-10-12.mjs",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-sigint-worker-2026-10-09.mjs",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-token-recovery-model-2026-10-09.mjs",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-token-recovery-posix-2026-10-12.mjs",
+    ".github/experiments/metadata-recovery-posix-2026-10-12/metadata-token-recovery-worker-2026-10-09.mjs",
+    ".github/workflows/browser-metadata-recovery-linux.yml"
+  ]
+}

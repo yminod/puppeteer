@@ -1,0 +1,110 @@
+name: Metadata token recovery model on Linux
+
+on:
+  push:
+    branches:
+      - experiment/browser-metadata-recovery-linux-2026-10-12
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: metadata-recovery-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PUPPETEER_SKIP_DOWNLOAD: true
+  FORCE_COLOR: 0
+  SOURCE_COMMIT: 944cdef2d6a3bf7b40a55e2ea4a18c5d76beb069
+  HARNESS: .github/experiments/metadata-recovery-posix-2026-10-12
+
+jobs:
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.15.0'
+
+      - name: Verify transport, native environment, and create fresh source input
+        run: |
+          mkdir "$RUNNER_TEMP/metadata-recovery-evidence"
+          artifact_dir="$RUNNER_TEMP/metadata-recovery-evidence"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          git diff --name-only "$SOURCE_COMMIT" HEAD | sort > "$artifact_dir/transport-actual.txt"
+          node --input-type=module -e 'import fs from "node:fs"; const m=JSON.parse(fs.readFileSync(process.argv[1])); console.log(m.transportPaths.join("\n"));' "$HARNESS/metadata-recovery-posix-inputs-2026-10-12.json" | sort > "$artifact_dir/transport-expected.txt"
+          diff -u "$artifact_dir/transport-expected.txt" "$artifact_dir/transport-actual.txt"
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            id
+            node --version
+            npm --version
+            findmnt -T "$artifact_dir"
+            git rev-parse HEAD
+          } | tee "$artifact_dir/environment.log"
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" != 0
+          test "$(findmnt -n -o FSTYPE -T "$artifact_dir")" = ext4
+          git worktree add --detach "$RUNNER_TEMP/metadata-recovery-source" "$SOURCE_COMMIT"
+          cp -R "$HARNESS" "$artifact_dir/as-run"
+
+      - name: Independently install and build the unchanged source and tests
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-recovery-evidence"
+          cd "$RUNNER_TEMP/metadata-recovery-source"
+          npm ci --no-audit --no-fund 2>&1 | tee "$artifact_dir/npm-ci.log"
+          npm run build --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build.log"
+          npm run build:test --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build-test.log"
+
+      - name: Verify independently compiled canonical inputs
+        id: inputs
+        run: |
+          node "$HARNESS/metadata-recovery-posix-audit-2026-10-12.mjs" verify --require-linux \
+            --repo="$RUNNER_TEMP/metadata-recovery-source" --output="$RUNNER_TEMP/metadata-recovery-evidence" \
+            2>&1 | tee "$RUNNER_TEMP/metadata-recovery-evidence/inputs.log"
+
+      - name: Execute eleven token model cases with native SIGINT
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' }}
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-recovery-evidence"
+          node "$artifact_dir/as-run/metadata-token-recovery-posix-2026-10-12.mjs" \
+            "$artifact_dir/token" "$RUNNER_TEMP/metadata-recovery-source" 2>&1 | tee "$artifact_dir/token.log"
+
+      - name: Execute thirteen unchanged-Cache SIGINT comparison cases
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' }}
+        run: |
+          artifact_dir="$RUNNER_TEMP/metadata-recovery-evidence"
+          node "$artifact_dir/as-run/metadata-sigint-posix-2026-10-12.mjs" \
+            "$artifact_dir/sigint" "$RUNNER_TEMP/metadata-recovery-source" 2>&1 | tee "$artifact_dir/sigint.log"
+
+      - name: Independently audit all cases, fixtures, hashes, and owned processes
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' }}
+        run: |
+          node "$HARNESS/metadata-recovery-posix-audit-2026-10-12.mjs" audit --require-linux \
+            --repo="$RUNNER_TEMP/metadata-recovery-source" --output="$RUNNER_TEMP/metadata-recovery-evidence" \
+            2>&1 | tee "$RUNNER_TEMP/metadata-recovery-evidence/audit.log"
+
+      - name: Preserve all evidence including failed cases and hidden guard files
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metadata-recovery-linux
+          path: ${{ runner.temp }}/metadata-recovery-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
