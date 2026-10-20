@@ -10,6 +10,7 @@ import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {stripVTControlCharacters} from 'node:util';
 
 const harness = path.dirname(fileURLToPath(import.meta.url));
 const manifest = JSON.parse(
@@ -72,9 +73,8 @@ if (mode === 'transport') {
       JSON.parse(fs.readFileSync(path.join(evidence, 'inputs-before.json'))),
     );
     if (suite === 'package') {
-      const log = fs.readFileSync(
-        path.join(evidence, 'package-test.log'),
-        'utf8',
+      const log = stripVTControlCharacters(
+        fs.readFileSync(path.join(evidence, 'package-test.log'), 'utf8'),
       );
       assert.match(
         log,
