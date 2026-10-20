@@ -1,0 +1,4551 @@
+diff --git a/packages/browsers/src/Cache.ts b/packages/browsers/src/Cache.ts
+index 3e424d6e34b..fa3af5aee10 100644
+--- a/packages/browsers/src/Cache.ts
++++ b/packages/browsers/src/Cache.ts
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++import {randomUUID} from 'node:crypto';
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+@@ -16,6 +17,11 @@ import {
+ } from './browser-data/browser-data.js';
+ import {DEBUG_PREFIXES, type Logger} from './debug.js';
+ import {detectBrowserPlatform} from './detectPlatform.js';
++import {readInstallMarker} from './installMarker.js';
++
++const METADATA_RENAME_MAX_ATTEMPTS = 5;
++const METADATA_RENAME_RETRY_DELAY = 50;
++const metadataRenameWait = new Int32Array(new SharedArrayBuffer(4));
+ 
+ /**
+  * @public
+@@ -65,6 +71,7 @@ export class InstalledBrowser {
+   }
+ 
+   writeMetadata(metadata: Metadata): void {
++    // This replaces the complete snapshot; a separate read is not a transaction.
+     this.#cache.writeMetadata(this.browser, metadata);
+   }
+ }
+@@ -160,9 +167,24 @@ export class Cache {
+   }
+ 
+   writeMetadata(browser: Browser, metadata: Metadata): void {
+-    const metatadaPath = this.metadataFile(browser);
+-    fs.mkdirSync(path.dirname(metatadaPath), {recursive: true});
+-    fs.writeFileSync(metatadaPath, JSON.stringify(metadata, null, 2));
++    const metadataPath = this.metadataFile(browser);
++    fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
++    this.#writeMetadataFile(metadataPath, metadata);
++  }
++
++  updateMetadata(
++    browser: Browser,
++    mutator: (metadata: Metadata) => void,
++  ): boolean {
++    // Synchronous RMW avoids yielding, but does not serialize other processes.
++    const metadata = this.readMetadata(browser);
++    const previous = JSON.stringify(metadata);
++    mutator(metadata);
++    if (JSON.stringify(metadata) === previous) {
++      return false;
++    }
++    this.writeMetadata(browser, metadata);
++    return true;
+   }
+ 
+   readExecutablePath(
+@@ -181,13 +203,30 @@ export class Cache {
+     buildId: string,
+     executablePath: string,
+   ): void {
+-    const metadata = this.readMetadata(browser);
+-    if (!metadata.executablePaths) {
+-      metadata.executablePaths = {};
+-    }
+     const key = `${platform}-${buildId}`;
+-    metadata.executablePaths[key] = executablePath;
+-    this.writeMetadata(browser, metadata);
++    this.updateMetadata(browser, metadata => {
++      metadata.executablePaths ??= {};
++      metadata.executablePaths[key] = executablePath;
++    });
++  }
++
++  deleteExecutablePath(
++    browser: Browser,
++    platform: BrowserPlatform,
++    buildId: string,
++  ): void {
++    const key = `${platform}-${buildId}`;
++    this.updateMetadata(browser, metadata => {
++      if (metadata.executablePaths?.[key]) {
++        delete metadata.executablePaths[key];
++      }
++    });
++  }
++
++  writeAlias(browser: Browser, alias: string, buildId: string): void {
++    this.updateMetadata(browser, metadata => {
++      metadata.aliases[alias] = buildId;
++    });
+   }
+ 
+   resolveAlias(browser: Browser, alias: string): string | undefined {
+@@ -235,25 +274,14 @@ export class Cache {
+     buildId: string,
+   ): void {
+     const installationDir = this.installationDir(browser, platform, buildId);
+-    const metadata = this.readMetadata(browser);
+-    let changed = false;
+-    for (const alias of Object.keys(metadata.aliases)) {
+-      if (metadata.aliases[alias] === buildId) {
+-        delete metadata.aliases[alias];
+-        changed = true;
++    this.updateMetadata(browser, metadata => {
++      for (const alias of Object.keys(metadata.aliases)) {
++        if (metadata.aliases[alias] === buildId) {
++          delete metadata.aliases[alias];
++        }
+       }
+-    }
+-    // Clean up executable path entry
+-    const key = `${platform}-${buildId}`;
+-    if (metadata.executablePaths?.[key]) {
+-      delete metadata.executablePaths[key];
+-      changed = true;
+-    }
+-    // Only touch the file if something was actually removed so that we do not
+-    // create a .metadata for a browser that never had one.
+-    if (changed) {
+-      this.writeMetadata(browser, metadata);
+-    }
++      delete metadata.executablePaths?.[`${platform}-${buildId}`];
++    });
+     fs.rmSync(installationDir, {
+       force: true,
+       recursive: true,
+@@ -312,6 +340,11 @@ export class Cache {
+       options.buildId,
+     );
+ 
++    const installMarker = readInstallMarker(installationDir);
++    if (installMarker) {
++      return installMarker.executablePath;
++    }
++
+     const storedExecutablePath = this.readExecutablePath(
+       options.browser,
+       options.platform,
+@@ -330,6 +363,51 @@ export class Cache {
+       ),
+     );
+   }
++
++  #writeMetadataFile(metadataPath: string, metadata: Metadata): void {
++    const temporaryPath = path.join(
++      path.dirname(metadataPath),
++      `.metadata-${process.pid}-${randomUUID()}`,
++    );
++    try {
++      fs.writeFileSync(temporaryPath, JSON.stringify(metadata, null, 2), {
++        flag: 'wx',
++      });
++      for (let attempt = 1; ; attempt++) {
++        try {
++          fs.renameSync(temporaryPath, metadataPath);
++          break;
++        } catch (error) {
++          if (
++            process.platform !== 'win32' ||
++            attempt >= METADATA_RENAME_MAX_ATTEMPTS ||
++            !(error instanceof Error) ||
++            !('code' in error) ||
++            !(
++              error.code === 'EPERM' ||
++              error.code === 'EBUSY' ||
++              error.code === 'EACCES'
++            )
++          ) {
++            throw error;
++          }
++          // Bound the wait while preserving the synchronous metadata API.
++          Atomics.wait(
++            metadataRenameWait,
++            0,
++            0,
++            attempt * METADATA_RENAME_RETRY_DELAY,
++          );
++        }
++      }
++    } finally {
++      try {
++        fs.rmSync(temporaryPath, {force: true});
++      } catch {
++        // A leftover uniquely named temp file is ignored by readers.
++      }
++    }
++  }
+ }
+ 
+ function parseFolderPath(
+diff --git a/packages/browsers/src/fileUtil.ts b/packages/browsers/src/fileUtil.ts
+index e529ad0a67d..40c9096143f 100644
+--- a/packages/browsers/src/fileUtil.ts
++++ b/packages/browsers/src/fileUtil.ts
+@@ -4,13 +4,11 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
+-import type {ChildProcessByStdio} from 'node:child_process';
+ import {spawnSync, spawn, execFile} from 'node:child_process';
+ import {constants, createReadStream, createWriteStream} from 'node:fs';
+ import {lstat, mkdir, readdir, symlink} from 'node:fs/promises';
+ import * as path from 'node:path';
+-import type {Readable, Transform} from 'node:stream';
+-import {Stream, Writable} from 'node:stream';
++import {Writable} from 'node:stream';
+ import {pipeline} from 'node:stream/promises';
+ import {promisify} from 'node:util';
+ 
+@@ -28,88 +26,101 @@ export async function unpackArchive(
+   folderPath: string,
+   logger?: Logger,
+ ): Promise<void> {
+-  if (!path.isAbsolute(folderPath)) {
+-    folderPath = path.resolve(process.cwd(), folderPath);
+-  }
+-  if (archivePath.endsWith('.zip')) {
+-    await mkdir(folderPath, {recursive: true});
+-    await extractZip(archivePath, folderPath, logger);
+-  } else if (archivePath.endsWith('.tar.bz2')) {
+-    await extractTar(archivePath, folderPath, 'bzip2', logger);
+-  } else if (archivePath.endsWith('.dmg')) {
+-    await mkdir(folderPath);
+-    await installDMG(archivePath, folderPath);
+-  } else if (archivePath.endsWith('.exe')) {
+-    // Firefox on Windows.
+-    const result = spawnSync(archivePath, [`/ExtractDir=${folderPath}`], {
+-      env: {
+-        __compat_layer: 'RunAsInvoker',
+-      },
+-    });
+-    if (result.status !== 0) {
+-      throw new Error(
+-        `Failed to extract ${archivePath} to ${folderPath}: ${result.output}`,
+-      );
+-    }
+-  } else if (archivePath.endsWith('.tar.xz')) {
+-    await extractTar(archivePath, folderPath, 'xz');
+-  } else {
+-    throw new Error(`Unsupported archive format: ${archivePath}`);
++  const outcome = await unpackArchiveWithCleanupState(
++    archivePath,
++    folderPath,
++    logger,
++  );
++  if (outcome.status === 'error') {
++    throw outcome.error;
+   }
+ }
+ 
+-function createTransformStream(
+-  child: ChildProcessByStdio<Writable, Readable, null>,
+-): Transform {
+-  const stream = new Stream.Transform({
+-    transform(chunk, encoding, callback) {
+-      if (!child.stdin.write(chunk, encoding)) {
+-        child.stdin.once('drain', callback);
+-      } else {
+-        callback();
+-      }
+-    },
++/**
++ * `isSafeToCleanup` tracks resources that this module can observe directly,
++ * such as extractor processes and DMG mounts. Third-party extractors may still
++ * have internal filesystem operations that are not exposed through their
++ * public completion boundary, so attempt removal remains best effort.
++ *
++ * @internal
++ */
++export type ArchiveUnpackOutcome =
++  | {status: 'success'; isSafeToCleanup: boolean}
++  | {status: 'error'; error: unknown; isSafeToCleanup: boolean};
+ 
+-    flush(callback) {
+-      if (child.stdout.destroyed) {
+-        callback();
+-      } else {
+-        child.stdin.end();
+-        child.stdout.on('close', callback);
++/**
++ * @internal
++ */
++export async function unpackArchiveWithCleanupState(
++  archivePath: string,
++  folderPath: string,
++  logger?: Logger,
++): Promise<ArchiveUnpackOutcome> {
++  if (!path.isAbsolute(folderPath)) {
++    folderPath = path.resolve(process.cwd(), folderPath);
++  }
++  try {
++    if (archivePath.endsWith('.zip')) {
++      await mkdir(folderPath, {recursive: true});
++      await extractZip(archivePath, folderPath, logger);
++    } else if (archivePath.endsWith('.tar.bz2')) {
++      await extractTar(archivePath, folderPath, 'bzip2', logger);
++    } else if (archivePath.endsWith('.dmg')) {
++      await mkdir(folderPath);
++      return await installDMG(archivePath, folderPath, logger);
++    } else if (archivePath.endsWith('.exe')) {
++      // Firefox on Windows.
++      const result = spawnSync(archivePath, [`/ExtractDir=${folderPath}`], {
++        env: {
++          __compat_layer: 'RunAsInvoker',
++        },
++      });
++      if (result.status !== 0) {
++        throw new Error(
++          `Failed to extract ${archivePath} to ${folderPath}: ${result.output}`,
++        );
+       }
+-    },
+-  });
+-
+-  child.stdin.on('error', e => {
+-    if ('code' in e && e.code === 'EPIPE') {
+-      // finished before reading the file finished (i.e. head)
+-      stream.emit('end');
++    } else if (archivePath.endsWith('.tar.xz')) {
++      await extractTar(archivePath, folderPath, 'xz');
+     } else {
+-      stream.destroy(e);
++      throw new Error(`Unsupported archive format: ${archivePath}`);
+     }
+-  });
+-
+-  child.stdout
+-    .on('data', data => {
+-      return stream.push(data);
+-    })
+-    .on('error', e => {
+-      return stream.destroy(e);
+-    });
+-
+-  child.once('close', () => {
+-    return stream.end();
+-  });
+-
+-  return stream;
++    return {status: 'success', isSafeToCleanup: true};
++  } catch (error) {
++    return {status: 'error', error, isSafeToCleanup: true};
++  }
+ }
+ 
+ /**
+  * @internal
+  */
+-export const internalConstantsForTesting = {
++export const internalConstantsForTesting: {
++  xz: string;
++  bzip2: string;
++  dmgDetachAttempts: number;
++  dmgDetachRetryDelay: number;
++  dmgExecFile: (
++    file: string,
++    args: readonly string[],
++  ) => Promise<{stdout: string; stderr: string}>;
++  dmgReaddir: (path: string) => Promise<string[]>;
++  delay: (milliseconds: number) => Promise<void>;
++} = {
+   xz: 'xz',
+   bzip2: 'bzip2',
++  dmgDetachAttempts: 3,
++  dmgDetachRetryDelay: 1000,
++  dmgExecFile: async (file, args) => {
++    return await execFileAsync(file, args);
++  },
++  dmgReaddir: async directory => {
++    return await readdir(directory);
++  },
++  delay: async (milliseconds: number): Promise<void> => {
++    await new Promise(resolve => {
++      setTimeout(resolve, milliseconds);
++    });
++  },
+ };
+ 
+ /**
+@@ -118,64 +129,146 @@ export const internalConstantsForTesting = {
+ async function extractTar(
+   tarPath: string,
+   folderPath: string,
+-  decompressUtilityName: keyof typeof internalConstantsForTesting,
++  decompressUtilityName: 'xz' | 'bzip2',
+   logger?: Logger,
+ ): Promise<void> {
+   const {unpackTar} = await import('modern-tar/fs');
+-  return await new Promise<void>((fulfill, reject) => {
+-    function handleError(utilityName: string) {
+-      return (error: Error) => {
+-        if ('code' in error && error.code === 'ENOENT') {
+-          error = new Error(
+-            `\`${utilityName}\` utility is required to unpack this archive`,
+-            {
+-              cause: error,
+-            },
+-          );
+-        }
+-        reject(error);
+-      };
++  const unpack = spawn(
++    internalConstantsForTesting[decompressUtilityName],
++    ['-d'],
++    {
++      stdio: ['pipe', 'pipe', 'inherit'],
++    },
++  );
++  const source = createReadStream(tarPath);
++  const tar = unpackTar(folderPath);
++  let firstError: Error | undefined;
++  let spawnError: Error | undefined;
++
++  const stopProducer = (error: Error): void => {
++    firstError ??= error;
++    source.destroy();
++    unpack.stdin.destroy();
++    unpack.stdout.destroy();
++    tar.destroy();
++    if (
++      unpack.pid !== undefined &&
++      unpack.exitCode === null &&
++      unpack.signalCode === null
++    ) {
++      try {
++        unpack.kill();
++      } catch {
++        // The close event remains the process-quiescence boundary.
++      }
+     }
+-    const unpack = spawn(
+-      internalConstantsForTesting[decompressUtilityName],
+-      ['-d'],
+-      {
+-        stdio: ['pipe', 'pipe', 'inherit'],
+-      },
+-    )
+-      .once('error', handleError(decompressUtilityName))
+-      .once('exit', code => {
+-        logger?.(DEBUG_PREFIXES.fileUtil)?.(
+-          `${decompressUtilityName} exited, code=${code}`,
+-        );
+-      });
++  };
+ 
+-    const tar = unpackTar(folderPath);
+-    tar.once('error', handleError('tar'));
+-    tar.once('finish', fulfill);
+-    createReadStream(tarPath).pipe(createTransformStream(unpack)).pipe(tar);
++  const childClosed = new Promise<{
++    code: number | null;
++    signal: NodeJS.Signals | null;
++  }>(resolve => {
++    unpack.once('error', error => {
++      spawnError = normalizeUtilityError(error, decompressUtilityName);
++      stopProducer(spawnError);
++    });
++    unpack.once('close', (code, signal) => {
++      logger?.(DEBUG_PREFIXES.fileUtil)?.(
++        `${decompressUtilityName} exited, code=${code}, signal=${signal}`,
++      );
++      resolve({code, signal});
++    });
++  });
++
++  const input = pipeline(source, unpack.stdin).catch(error => {
++    stopProducer(error as Error);
++    throw error;
++  });
++  const output = pipeline(unpack.stdout, tar).catch(error => {
++    stopProducer(error as Error);
++    throw error;
+   });
++  const [inputResult, outputResult, childResult] = await Promise.allSettled([
++    input,
++    output,
++    childClosed,
++  ]);
++
++  if (spawnError) {
++    throw spawnError;
++  }
++  if (childResult.status === 'rejected') {
++    throw childResult.reason;
++  }
++  if (childResult.value.code !== null && childResult.value.code !== 0) {
++    throw new Error(
++      `\`${decompressUtilityName}\` exited with ` +
++        `code ${childResult.value.code}`,
++    );
++  }
++  if (firstError) {
++    throw firstError;
++  }
++  if (inputResult.status === 'rejected') {
++    throw inputResult.reason;
++  }
++  if (outputResult.status === 'rejected') {
++    throw outputResult.reason;
++  }
++  if (childResult.value.signal) {
++    throw new Error(
++      `\`${decompressUtilityName}\` exited with signal ${childResult.value.signal}`,
++    );
++  }
++}
++
++function normalizeUtilityError(error: Error, utilityName: string): Error {
++  if ('code' in error && error.code === 'ENOENT') {
++    return new Error(
++      `\`${utilityName}\` utility is required to unpack this archive`,
++      {
++        cause: error,
++      },
++    );
++  }
++  return error;
+ }
+ 
+ /**
+  * @internal
+  */
+-async function installDMG(dmgPath: string, folderPath: string): Promise<void> {
+-  const {stdout} = await execFileAsync('hdiutil', [
+-    'attach',
+-    '-nobrowse',
+-    '-noautoopen',
+-    dmgPath,
+-  ]);
++async function installDMG(
++  dmgPath: string,
++  folderPath: string,
++  logger?: Logger,
++): Promise<ArchiveUnpackOutcome> {
++  let stdout: string;
++  try {
++    ({stdout} = await internalConstantsForTesting.dmgExecFile('hdiutil', [
++      'attach',
++      '-nobrowse',
++      '-noautoopen',
++      dmgPath,
++    ]));
++  } catch (error) {
++    return {status: 'error', error, isSafeToCleanup: true};
++  }
+ 
+   const volumes = stdout.match(/\/Volumes\/(.*)/m);
+   if (!volumes) {
+-    throw new Error(`Could not find volume path in ${stdout}`);
++    return {
++      status: 'error',
++      error: new Error(`Could not find volume path in ${stdout}`),
++      // hdiutil reported a successful attach, but without an identity there is
++      // no way to confirm that the mounted resource was released.
++      isSafeToCleanup: false,
++    };
+   }
+   const mountPath = volumes[0]!;
+ 
++  let primaryOutcome: ArchiveUnpackOutcome;
+   try {
+-    const fileNames = await readdir(mountPath);
++    const fileNames = await internalConstantsForTesting.dmgReaddir(mountPath);
+     const appName = fileNames.find(item => {
+       return typeof item === 'string' && item.endsWith('.app');
+     });
+@@ -184,10 +277,46 @@ async function installDMG(dmgPath: string, folderPath: string): Promise<void> {
+     }
+     const mountedPath = path.join(mountPath!, appName);
+ 
+-    await execFileAsync('cp', ['-R', mountedPath, folderPath]);
+-  } finally {
+-    await execFileAsync('hdiutil', ['detach', mountPath, '-quiet']);
++    await internalConstantsForTesting.dmgExecFile('cp', [
++      '-R',
++      mountedPath,
++      folderPath,
++    ]);
++    primaryOutcome = {status: 'success', isSafeToCleanup: false};
++  } catch (error) {
++    primaryOutcome = {status: 'error', error, isSafeToCleanup: false};
++  }
++
++  const isSafeToCleanup = await detachDMG(mountPath, logger);
++  return {...primaryOutcome, isSafeToCleanup};
++}
++
++async function detachDMG(mountPath: string, logger?: Logger): Promise<boolean> {
++  const attempts = internalConstantsForTesting.dmgDetachAttempts;
++  for (let attempt = 1; attempt <= attempts; ++attempt) {
++    try {
++      await internalConstantsForTesting.dmgExecFile('hdiutil', [
++        'detach',
++        mountPath,
++        '-quiet',
++      ]);
++      return true;
++    } catch (error) {
++      logger?.(DEBUG_PREFIXES.fileUtil)?.(
++        `Failed to detach DMG mount ${mountPath} ` +
++          `(attempt ${attempt}/${attempts}): ${String(error)}`,
++      );
++      if (attempt < attempts) {
++        await internalConstantsForTesting.delay(
++          internalConstantsForTesting.dmgDetachRetryDelay,
++        );
++      }
++    }
+   }
++  logger?.(DEBUG_PREFIXES.fileUtil)?.(
++    `Retaining DMG mount after ${attempts} failed detach attempts: ${mountPath}`,
++  );
++  return false;
+ }
+ 
+ /**
+@@ -236,17 +365,36 @@ export async function extractZipWithYauzl(
+   const open = promisify<string, Options, ZipFile>(yauzl.open);
+   try {
+     const zipFile = await open(archivePath, {lazyEntries: true});
+-    await new Promise((resolve, reject) => {
+-      zipFile
+-        .on('error', reject)
+-        .on('end', resolve)
+-        .on('entry', entry => {
+-          extractZipEntry(zipFile, entry, folderPath).then(() => {
+-            zipFile.readEntry();
+-          }, reject);
+-        })
+-        .readEntry();
++    let activeEntry: Promise<void> | undefined;
++    let failed = false;
++    const archiveClosed = new Promise<void>(resolve => {
++      zipFile.once('close', resolve);
+     });
++    try {
++      await new Promise<void>((resolve, reject) => {
++        const fail = (error: unknown): void => {
++          failed = true;
++          reject(error);
++        };
++
++        zipFile
++          .on('error', fail)
++          .on('end', resolve)
++          .on('entry', entry => {
++            activeEntry = extractZipEntry(zipFile, entry, folderPath);
++            void activeEntry.then(() => {
++              if (!failed) {
++                zipFile.readEntry();
++              }
++            }, fail);
++          })
++          .readEntry();
++      });
++    } finally {
++      zipFile.close();
++      // Archive close can precede an active entry's output completion.
++      await Promise.allSettled([activeEntry, archiveClosed]);
++    }
+   } catch (error) {
+     throw new Error(`Extraction failed: ${archivePath}`, {cause: error});
+   }
+diff --git a/packages/browsers/src/httpUtil.ts b/packages/browsers/src/httpUtil.ts
+index 661fe6a8457..25d69072374 100644
+--- a/packages/browsers/src/httpUtil.ts
++++ b/packages/browsers/src/httpUtil.ts
+@@ -8,11 +8,13 @@ import {createHash} from 'node:crypto';
+ import {createWriteStream, unlinkSync} from 'node:fs';
+ import * as http from 'node:http';
+ import * as https from 'node:https';
++import {Transform} from 'node:stream';
++import {finished, pipeline} from 'node:stream/promises';
+ import {URL, urlToHttpOptions} from 'node:url';
+ 
+ export async function headHttpRequest(url: URL): Promise<boolean> {
+   return await new Promise(resolve => {
+-    httpRequest(
++    void httpRequest(
+       url,
+       'HEAD',
+       response => {
+@@ -21,15 +23,12 @@ export async function headHttpRequest(url: URL): Promise<boolean> {
+         resolve(response.statusCode === 200);
+       },
+       false,
+-    )
+-      .then(request => {
+-        request.on('error', () => {
+-          resolve(false);
+-        });
+-      })
+-      .catch(() => {
++      () => {
+         resolve(false);
+-      });
++      },
++    ).catch(() => {
++      resolve(false);
++    });
+   });
+ }
+ 
+@@ -38,6 +37,7 @@ export async function httpRequest(
+   method: string,
+   response: (x: http.IncomingMessage) => void,
+   keepAlive = true,
++  onError?: (error: Error) => void,
+ ): Promise<http.ClientRequest> {
+   let agent: http.Agent | undefined;
+   try {
+@@ -65,7 +65,15 @@ export async function httpRequest(
+       res.statusCode < 400 &&
+       res.headers.location
+     ) {
+-      void httpRequest(new URL(res.headers.location, url), method, response);
++      void httpRequest(
++        new URL(res.headers.location, url),
++        method,
++        response,
++        keepAlive,
++        onError,
++      ).catch(error => {
++        onError?.(error);
++      });
+       // consume response data to free up memory
+       // And prevents the connection from being kept alive
+       res.resume();
+@@ -77,6 +85,9 @@ export async function httpRequest(
+     options.protocol === 'https:'
+       ? https.request(options, requestCallback)
+       : http.request(options, requestCallback);
++  if (onError) {
++    request.once('error', onError);
++  }
+   request.end();
+   return request;
+ }
+@@ -107,103 +118,91 @@ class HashVerifier {
+ /**
+  * @internal
+  */
+-export function downloadFile(
++export async function downloadFile(
+   url: URL,
+   destinationPath: string,
+   progressCallback?: (downloadedBytes: number, totalBytes: number) => void,
+   expectedHash?: string,
+ ): Promise<void> {
+-  return new Promise<void>(async (resolve, reject) => {
+-    let downloadedBytes = 0;
+-    let totalBytes: number | undefined;
+-    const verifier = expectedHash ? new HashVerifier() : null;
++  const response = await new Promise<http.IncomingMessage>(
++    (resolve, reject) => {
++      void httpRequest(url, 'GET', resolve, true, reject).catch(reject);
++    },
++  );
+ 
+-    const cleanup = (): void => {
+-      try {
+-        unlinkSync(destinationPath);
+-      } catch {}
+-    };
++  if (response.statusCode !== 200) {
++    const responseClosed = finished(response).catch(() => {});
++    response.destroy();
++    await responseClosed;
++    throw new Error(
++      `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
++    );
++  }
+ 
+-    const downloadError = (cause?: Error): Error => {
+-      const options = cause ? {cause} : undefined;
+-      if (totalBytes === undefined) {
+-        return new Error(
+-          `Download failed: connection closed before the download completed. URL: ${url}`,
+-          options,
+-        );
+-      }
++  let downloadedBytes = 0;
++  const contentLength = Number.parseInt(
++    response.headers['content-length'] ?? '',
++    10,
++  );
++  const totalBytes = Number.isFinite(contentLength) ? contentLength : undefined;
++  const downloadError = (cause: unknown): Error => {
++    if (totalBytes === undefined) {
+       return new Error(
+-        `Download failed: expected ${totalBytes} bytes, received ${downloadedBytes} bytes. URL: ${url}`,
+-        options,
++        `Download failed: connection closed before the download completed. URL: ${url}`,
++        {cause},
+       );
+-    };
++    }
++    return new Error(
++      `Download failed: expected ${totalBytes} bytes, received ${downloadedBytes} bytes. URL: ${url}`,
++      {cause},
++    );
++  };
++  // Local failures can abort the response too; preserve their primary error.
++  let firstError: unknown;
++  let responseError: Error | undefined;
++  const verifier = expectedHash ? new HashVerifier() : null;
++  const progress = new Transform({
++    transform(chunk: Buffer, _encoding, callback) {
++      try {
++        downloadedBytes += chunk.length;
++        verifier?.update(chunk);
++        progressCallback?.(downloadedBytes, totalBytes ?? 0);
++      } catch (error) {
++        const failure =
++          error instanceof Error ? error : new Error(String(error));
++        firstError ??= failure;
++        callback(failure);
++        return;
++      }
++      callback(null, chunk);
++    },
++  });
+ 
+-    try {
+-      const request = await httpRequest(url, 'GET', response => {
+-        if (response.statusCode !== 200) {
+-          const error = new Error(
+-            `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
+-          );
+-          // consume response data to free up memory
+-          response.resume();
+-          reject(error);
+-          return;
+-        }
+-        const file = createWriteStream(destinationPath);
+-        let error: Error | undefined;
+-        const failDownload = (downloadError: Error): void => {
+-          error ??= downloadError;
+-          response.destroy();
+-          file.destroy();
+-        };
+-        file.on('close', () => {
+-          if (error) {
+-            cleanup();
+-            reject(error);
+-            return;
+-          }
+-          if (verifier && expectedHash) {
+-            try {
+-              verifier.verify(url, destinationPath, expectedHash);
+-            } catch (err) {
+-              reject(err);
+-              return;
+-            }
+-          }
+-          return resolve();
+-        });
+-        file.on('error', failDownload);
+-        const contentLength = Number.parseInt(
+-          response.headers['content-length'] ?? '',
+-          10,
+-        );
+-        totalBytes = Number.isFinite(contentLength) ? contentLength : undefined;
+-        response.on('close', () => {
+-          if (!response.complete) {
+-            failDownload(downloadError());
+-          }
+-        });
+-        response.on('error', responseError => {
+-          failDownload(
+-            response.complete ? responseError : downloadError(responseError),
+-          );
+-        });
+-        response.on('data', (chunk: Buffer) => {
+-          downloadedBytes += chunk.length;
+-          verifier?.update(chunk);
+-          if (progressCallback) {
+-            progressCallback(downloadedBytes, totalBytes ?? 0);
+-          }
+-        });
+-        response.pipe(file);
+-      });
+-      request.on('error', error => {
+-        return reject(error);
+-      });
+-    } catch (error) {
+-      reject(error);
++  const destination = createWriteStream(destinationPath);
++  destination.once('error', error => {
++    firstError ??= error;
++  });
++  response.once('error', error => {
++    if (!firstError) {
++      responseError = error;
+     }
++    firstError ??= error;
+   });
++  try {
++    await pipeline(response, progress, destination);
++  } catch (error) {
++    // pipeline waits for teardown before removing the partial download.
++    try {
++      unlinkSync(destinationPath);
++    } catch {}
++    if (!response.complete && error === responseError) {
++      throw downloadError(error);
++    }
++    throw error;
++  }
++  if (verifier && expectedHash) {
++    verifier.verify(url, destinationPath, expectedHash);
++  }
+ }
+ 
+ export async function getJSON(url: URL): Promise<unknown> {
+@@ -216,36 +215,30 @@ export async function getJSON(url: URL): Promise<unknown> {
+ }
+ 
+ export function getText(url: URL): Promise<string> {
+-  return new Promise(async (resolve, reject) => {
+-    try {
+-      const request = await httpRequest(
+-        url,
+-        'GET',
+-        response => {
+-          let data = '';
+-          if (response.statusCode && response.statusCode >= 400) {
+-            return reject(new Error(`Got status code ${response.statusCode}`));
++  return new Promise((resolve, reject) => {
++    void httpRequest(
++      url,
++      'GET',
++      response => {
++        let data = '';
++        if (response.statusCode && response.statusCode >= 400) {
++          return reject(new Error(`Got status code ${response.statusCode}`));
++        }
++        response.on('data', chunk => {
++          data += chunk;
++        });
++        response.on('end', () => {
++          try {
++            return resolve(String(data));
++          } catch {
++            return reject(
++              new Error(`Failed to read text response from ${url}`),
++            );
+           }
+-          response.on('data', chunk => {
+-            data += chunk;
+-          });
+-          response.on('end', () => {
+-            try {
+-              return resolve(String(data));
+-            } catch {
+-              return reject(
+-                new Error(`Failed to read text response from ${url}`),
+-              );
+-            }
+-          });
+-        },
+-        false,
+-      );
+-      request.on('error', err => {
+-        reject(err);
+-      });
+-    } catch (err) {
+-      reject(err);
+-    }
++        });
++      },
++      false,
++      reject,
++    ).catch(reject);
+   });
+ }
+diff --git a/packages/browsers/src/install.ts b/packages/browsers/src/install.ts
+index 769987a4492..f0b7253ec3e 100644
+--- a/packages/browsers/src/install.ts
++++ b/packages/browsers/src/install.ts
+@@ -7,7 +7,7 @@
+ import assert from 'node:assert';
+ import {spawnSync} from 'node:child_process';
+ import {existsSync, readFileSync} from 'node:fs';
+-import {mkdir, unlink} from 'node:fs/promises';
++import {mkdir} from 'node:fs/promises';
+ import os from 'node:os';
+ import path from 'node:path';
+ 
+@@ -15,13 +15,27 @@ import {
+   Browser,
+   BrowserPlatform,
+   downloadUrls,
++  executablePathByBrowser,
+ } from './browser-data/browser-data.js';
+ import {Cache, InstalledBrowser} from './Cache.js';
+ import {debug, DEBUG_PREFIXES, type Logger} from './debug.js';
+ import {DefaultProvider} from './DefaultProvider.js';
+ import {detectBrowserPlatform} from './detectPlatform.js';
+-import {unpackArchive} from './fileUtil.js';
++import {unpackArchiveWithCleanupState} from './fileUtil.js';
+ import {downloadFile, headHttpRequest} from './httpUtil.js';
++import {
++  InvalidInstallMarkerError,
++  readInstallMarker,
++  writeInstallMarker,
++} from './installMarker.js';
++import {
++  AmbiguousInstallPublicationError,
++  createInstallAttempt,
++  InvalidInstallTreeError,
++  publishInstallArchive,
++  publishInstallTree,
++  removeInstallAttempt,
++} from './installStaging.js';
+ import {ProgressBar} from './ProgressBar.js';
+ import type {BrowserProvider} from './provider.js';
+ 
+@@ -91,6 +105,9 @@ export interface InstallOptions {
+   /**
+    * Whether to unpack and install browser archives.
+    *
++   * Archive-only installation publishes a completed download using a hard
++   * link. The cache filesystem must support hard links when this is `false`.
++   *
+    * @defaultValue `true`
+    */
+   unpack?: boolean;
+@@ -157,13 +174,15 @@ export interface InstallOptions {
+   logger?: Logger;
+ }
+ 
++class TerminalInstallationError extends Error {}
++
+ /**
+  * Thrown when an installation folder is present but does not hold a browser
+  * that can be launched.
+  *
+  * @internal
+  */
+-export class IncompleteInstallationError extends Error {}
++export class IncompleteInstallationError extends TerminalInstallationError {}
+ 
+ /**
+  * Install using custom provider plugins.
+@@ -261,6 +280,9 @@ async function installWithProviders(
+       // Download and install using the URL from the provider
+       return await installUrl(url, options, provider, logger);
+     } catch (err) {
++      if (err instanceof TerminalInstallationError) {
++        throw err;
++      }
+       logger?.(DEBUG_PREFIXES.install)?.(
+         `Provider ${provider.getName()} failed: ${(err as Error).message}`,
+       );
+@@ -279,14 +301,6 @@ async function installWithProviders(
+     })
+     .join('\n');
+   const message = `All providers failed for ${options.browser} ${options.buildId}:\n${errorDetails}`;
+-  if (
+-    errors.length > 0 &&
+-    errors.every(e => {
+-      return e.error instanceof IncompleteInstallationError;
+-    })
+-  ) {
+-    throw new IncompleteInstallationError(message);
+-  }
+   throw new Error(message);
+ }
+ 
+@@ -429,19 +443,67 @@ async function installUrl(
+     if (existsSync(archivePath)) {
+       return archivePath;
+     }
+-    logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
+-    debugTime('download');
+-    await downloadFile(
+-      url,
+-      archivePath,
+-      downloadProgressCallback,
+-      options.expectedHash,
+-    );
+-    debugTimeEnd('download', logger);
+-    return archivePath;
++    let attempt;
++    try {
++      attempt = await createInstallAttempt(
++        browserRoot,
++        archiveSuffix(fileName),
++      );
++    } catch (error) {
++      throw terminalError(error);
++    }
++    let canCleanup = false;
++    try {
++      logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
++      try {
++        debugTime('download');
++        await downloadFile(
++          url,
++          attempt.archivePath,
++          downloadProgressCallback,
++          options.expectedHash,
++        );
++      } finally {
++        // downloadFile only settles after its request and destination writer
++        // have stopped, so both successful and failed attempts are removable.
++        canCleanup = true;
++        debugTimeEnd('download', logger);
++      }
++      try {
++        await publishInstallArchive(attempt.archivePath, archivePath);
++      } catch (error) {
++        throw terminalError(error);
++      }
++      return archivePath;
++    } finally {
++      await cleanupInstallAttempt(attempt.path, canCleanup, logger);
++    }
++  }
++
++  const existingInstallation = inspectExistingInstall(
++    cache,
++    options.browser,
++    options.platform,
++    options.buildId,
++  );
++  if (existingInstallation) {
++    try {
++      if (existingInstallation.kind === 'legacy') {
++        await runSetup(existingInstallation.browser, logger);
++      }
++      await runPostInstallSteps(
++        cache,
++        existingInstallation.browser,
++        existingInstallation.kind,
++        options,
++        logger,
++      );
++    } catch (error) {
++      throw terminalError(error);
++    }
++    return existingInstallation.browser;
+   }
+ 
+-  // Get executable path from provider once (used for both cached and new installations)
+   const relativeExecutablePath = await provider.getExecutablePath({
+     browser: options.browser,
+     buildId: options.buildId,
+@@ -451,51 +513,31 @@ async function installUrl(
+     `Using executable path from provider: ${relativeExecutablePath}`,
+   );
+ 
+-  const installedBrowser = new InstalledBrowser(
+-    cache,
+-    options.browser,
+-    options.buildId,
+-    options.platform,
+-  );
+-
+-  // Write metadata for the installation (only for non-default providers)
+-  if (!(provider instanceof DefaultProvider)) {
+-    cache.writeExecutablePath(
+-      options.browser,
+-      options.platform,
+-      options.buildId,
+-      relativeExecutablePath,
+-    );
++  let attempt;
++  try {
++    attempt = await createInstallAttempt(browserRoot, archiveSuffix(fileName));
++  } catch (error) {
++    throw terminalError(error);
+   }
+-
++  let canCleanup = false;
++  let hasUnreleasedResources = false;
+   try {
+-    if (existsSync(outputPath)) {
+-      if (!existsSync(installedBrowser.executablePath)) {
+-        throw new IncompleteInstallationError(
+-          `The browser folder (${outputPath}) exists but the executable (${installedBrowser.executablePath}) is missing. ` +
+-            `An earlier install of this build probably did not finish. ` +
+-            `Delete ${outputPath} and install the browser again.`,
+-        );
+-      }
+-      await runSetup(installedBrowser, logger);
+-      if (options.installDeps) {
+-        await installDeps(installedBrowser, logger);
+-      }
+-      return installedBrowser;
+-    }
+-
+-    // Check if archive already exists (e.g., from a custom provider)
++    let candidateArchivePath = archivePath;
+     if (!existsSync(archivePath)) {
++      candidateArchivePath = attempt.archivePath;
+       logger?.(DEBUG_PREFIXES.install)?.(`Downloading binary from ${url}`);
+       try {
+         debugTime('download');
+         await downloadFile(
+           url,
+-          archivePath,
++          candidateArchivePath,
+           downloadProgressCallback,
+           options.expectedHash,
+         );
+       } finally {
++        // downloadFile only settles after its request and destination writer
++        // have stopped, so both successful and failed attempts are removable.
++        canCleanup = true;
+         debugTimeEnd('download', logger);
+       }
+     } else {
+@@ -505,35 +547,82 @@ async function installUrl(
+     }
+ 
+     logger?.(DEBUG_PREFIXES.install)?.(
+-      `Installing ${archivePath} to ${outputPath}`,
++      `Installing ${candidateArchivePath} to ${attempt.outputPath}`,
+     );
++    canCleanup = false;
+     try {
+       debugTime('extract');
+-      await unpackArchive(archivePath, outputPath, options.logger);
++      const outcome = await unpackArchiveWithCleanupState(
++        candidateArchivePath,
++        attempt.outputPath,
++        options.logger,
++      );
++      canCleanup = outcome.isSafeToCleanup;
++      hasUnreleasedResources = !outcome.isSafeToCleanup;
++      if (outcome.status === 'error') {
++        throw outcome.error;
++      }
+     } finally {
++      // DMG extraction has a separate mount-release boundary. Other archive
++      // producers settle after their observable streams and direct children
++      // stop. Attempt removal remains best effort because third-party
++      // extractors may not expose all internal filesystem operations.
++      if (!candidateArchivePath.endsWith('.dmg')) {
++        canCleanup = true;
++      }
+       debugTimeEnd('extract', logger);
+     }
+ 
+-    if (options.buildIdAlias) {
+-      const metadata = installedBrowser.readMetadata();
+-      metadata.aliases[options.buildIdAlias] = options.buildId;
+-      installedBrowser.writeMetadata(metadata);
++    const stagedBrowser = {
++      browser: options.browser,
++      platform: options.platform,
++      executablePath: path.join(attempt.outputPath, relativeExecutablePath),
++    };
++    try {
++      await runSetup(stagedBrowser, logger);
++    } catch (error) {
++      throw terminalError(error);
+     }
++    writeInstallMarker(attempt.outputPath, relativeExecutablePath);
+ 
+-    await runSetup(installedBrowser, logger);
+-    if (options.installDeps) {
+-      await installDeps(installedBrowser, logger);
++    try {
++      await publishInstallTree(attempt.outputPath, outputPath);
++    } catch (error) {
++      throw terminalError(error);
++    }
++    const installedBrowser = new InstalledBrowser(
++      cache,
++      options.browser,
++      options.buildId,
++      options.platform,
++    );
++    try {
++      await runPostInstallSteps(
++        cache,
++        installedBrowser,
++        'new',
++        options,
++        logger,
++      );
++    } catch (error) {
++      throw terminalError(error);
+     }
+     return installedBrowser;
+-  } finally {
+-    if (existsSync(archivePath)) {
+-      await unlink(archivePath);
++  } catch (error) {
++    if (hasUnreleasedResources) {
++      throw terminalError(error);
+     }
++    throw error;
++  } finally {
++    await cleanupInstallAttempt(attempt.path, canCleanup, logger);
+   }
+ }
+ 
+ async function runSetup(
+-  installedBrowser: InstalledBrowser,
++  installedBrowser: Pick<
++    InstalledBrowser,
++    'browser' | 'platform' | 'executablePath'
++  >,
+   logger?: Logger,
+ ): Promise<void> {
+   // On Windows for Chrome invoke setup.exe to configure sandboxes.
+@@ -565,6 +654,130 @@ async function runSetup(
+   }
+ }
+ 
++function inspectExistingInstall(
++  cache: Cache,
++  browser: Browser,
++  platform: BrowserPlatform,
++  buildId: string,
++): {browser: InstalledBrowser; kind: 'new' | 'legacy'} | undefined {
++  const outputPath = cache.installationDir(browser, platform, buildId);
++  if (!existsSync(outputPath)) {
++    return;
++  }
++  let installMarker;
++  try {
++    installMarker = readInstallMarker(outputPath);
++  } catch (error) {
++    if (error instanceof InvalidInstallMarkerError) {
++      throw new IncompleteInstallationError(error.message, {cause: error});
++    }
++    throw error;
++  }
++  const installedBrowser = new InstalledBrowser(
++    cache,
++    browser,
++    buildId,
++    platform,
++  );
++  if (installMarker) {
++    return {browser: installedBrowser, kind: 'new'};
++  }
++  if (!existsSync(installedBrowser.executablePath)) {
++    throw new IncompleteInstallationError(
++      `The browser folder (${outputPath}) exists but the executable (${installedBrowser.executablePath}) is missing. ` +
++        `An earlier install of this build probably did not finish. ` +
++        `Delete ${outputPath} and install the browser again.`,
++    );
++  }
++  return {browser: installedBrowser, kind: 'legacy'};
++}
++
++async function runPostInstallSteps(
++  cache: Cache,
++  installedBrowser: InstalledBrowser,
++  kind: 'new' | 'legacy',
++  options: InstallOptions,
++  logger?: Logger,
++): Promise<void> {
++  if (kind === 'new') {
++    const installMarker = readInstallMarker(installedBrowser.path);
++    assert(installMarker, 'New install marker is missing');
++    const defaultExecutablePath = executablePathByBrowser[
++      installedBrowser.browser
++    ](installedBrowser.platform, installedBrowser.buildId);
++    if (installMarker.relativeExecutablePath === defaultExecutablePath) {
++      cache.deleteExecutablePath(
++        installedBrowser.browser,
++        installedBrowser.platform,
++        installedBrowser.buildId,
++      );
++    } else {
++      cache.writeExecutablePath(
++        installedBrowser.browser,
++        installedBrowser.platform,
++        installedBrowser.buildId,
++        installMarker.relativeExecutablePath,
++      );
++    }
++  }
++  if (options.installDeps) {
++    await installDeps(installedBrowser, logger);
++  }
++  if (options.buildIdAlias) {
++    cache.writeAlias(
++      installedBrowser.browser,
++      options.buildIdAlias,
++      installedBrowser.buildId,
++    );
++  }
++}
++
++async function cleanupInstallAttempt(
++  attemptPath: string,
++  canCleanup: boolean,
++  logger?: Logger,
++): Promise<void> {
++  if (!canCleanup) {
++    logger?.(DEBUG_PREFIXES.install)?.(
++      `Retaining install attempt because writer shutdown or resource release is not confirmed: ${attemptPath}`,
++    );
++    return;
++  }
++  try {
++    await removeInstallAttempt(attemptPath);
++  } catch (error) {
++    logger?.(DEBUG_PREFIXES.install)?.(
++      `Failed to clean up install attempt ${attemptPath}: ${(error as Error).message}`,
++    );
++  }
++}
++
++function terminalError(error: unknown): TerminalInstallationError {
++  if (error instanceof TerminalInstallationError) {
++    return error;
++  }
++  if (
++    error instanceof AmbiguousInstallPublicationError ||
++    error instanceof InvalidInstallMarkerError ||
++    error instanceof InvalidInstallTreeError
++  ) {
++    return new IncompleteInstallationError(error.message, {cause: error});
++  }
++  if (error instanceof Error) {
++    return new TerminalInstallationError(error.message, {cause: error});
++  }
++  return new TerminalInstallationError(String(error), {cause: error});
++}
++
++function archiveSuffix(fileName: string): string {
++  for (const suffix of ['.tar.bz2', '.tar.xz', '.zip', '.dmg', '.exe']) {
++    if (fileName.endsWith(suffix)) {
++      return suffix;
++    }
++  }
++  return '';
++}
++
+ /**
+  * @public
+  */
+diff --git a/packages/browsers/src/installMarker.ts b/packages/browsers/src/installMarker.ts
+new file mode 100644
+index 00000000000..c19ef628179
+--- /dev/null
++++ b/packages/browsers/src/installMarker.ts
+@@ -0,0 +1,182 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import fs from 'node:fs';
++import path from 'node:path';
++
++export const INSTALL_MARKER_FILE = '.puppeteer-install';
++
++/**
++ * @internal
++ */
++export interface InstallMarker {
++  version: 1;
++  relativeExecutablePath: string;
++}
++
++/**
++ * @internal
++ */
++export interface ValidatedInstallMarker extends InstallMarker {
++  executablePath: string;
++}
++
++/**
++ * @internal
++ */
++export class InvalidInstallMarkerError extends Error {}
++
++/**
++ * Reads and validates an installation-local completion marker. A missing
++ * marker identifies a legacy installation and is reported as `undefined`.
++ *
++ * @internal
++ */
++export function readInstallMarker(
++  installationDir: string,
++): ValidatedInstallMarker | undefined {
++  const markerPath = path.join(installationDir, INSTALL_MARKER_FILE);
++  let markerStat: fs.Stats;
++  try {
++    markerStat = fs.lstatSync(markerPath);
++  } catch (error) {
++    if (isErrnoException(error) && error.code === 'ENOENT') {
++      return;
++    }
++    throw invalidMarker(markerPath, error);
++  }
++  if (!markerStat.isFile()) {
++    throw invalidMarker(markerPath, 'the marker is not a regular file');
++  }
++
++  let value: unknown;
++  try {
++    value = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
++  } catch (error) {
++    throw invalidMarker(markerPath, error);
++  }
++  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
++    throw invalidMarker(markerPath, 'the marker is not a JSON object');
++  }
++
++  const marker = value as Record<string, unknown>;
++  if (marker['version'] !== 1) {
++    throw invalidMarker(markerPath, 'unsupported marker version');
++  }
++  const relativeExecutablePath = marker['relativeExecutablePath'];
++  if (
++    typeof relativeExecutablePath !== 'string' ||
++    relativeExecutablePath.length === 0
++  ) {
++    throw invalidMarker(
++      markerPath,
++      'relativeExecutablePath must be a non-empty string',
++    );
++  }
++
++  const executablePath = validateExecutablePath(
++    installationDir,
++    relativeExecutablePath,
++    markerPath,
++  );
++  return {
++    version: 1,
++    relativeExecutablePath,
++    executablePath,
++  };
++}
++
++/**
++ * Writes the completion marker without replacing an archive-provided entry.
++ * The executable must already be complete when this function is called.
++ *
++ * @internal
++ */
++export function writeInstallMarker(
++  installationDir: string,
++  relativeExecutablePath: string,
++): void {
++  const markerPath = path.join(installationDir, INSTALL_MARKER_FILE);
++  validateExecutablePath(installationDir, relativeExecutablePath, markerPath);
++  const marker: InstallMarker = {
++    version: 1,
++    relativeExecutablePath,
++  };
++  fs.writeFileSync(markerPath, JSON.stringify(marker), {flag: 'wx'});
++}
++
++function validateExecutablePath(
++  installationDir: string,
++  relativeExecutablePath: string,
++  markerPath: string,
++): string {
++  if (path.isAbsolute(relativeExecutablePath)) {
++    throw invalidMarker(markerPath, 'the executable path is absolute');
++  }
++
++  const installationRoot = path.resolve(installationDir);
++  const executablePath = path.resolve(installationRoot, relativeExecutablePath);
++  if (!isWithin(installationRoot, executablePath)) {
++    throw invalidMarker(
++      markerPath,
++      'the executable path escapes the installation root',
++    );
++  }
++
++  let canonicalRoot: string;
++  let canonicalExecutablePath: string;
++  try {
++    canonicalRoot = fs.realpathSync(installationRoot);
++    canonicalExecutablePath = fs.realpathSync(executablePath);
++  } catch (error) {
++    throw invalidMarker(markerPath, error);
++  }
++  if (!isWithin(canonicalRoot, canonicalExecutablePath)) {
++    throw invalidMarker(
++      markerPath,
++      'the executable resolves outside the installation root',
++    );
++  }
++
++  try {
++    if (!fs.statSync(executablePath).isFile()) {
++      throw invalidMarker(
++        markerPath,
++        'the executable target is not a regular file',
++      );
++    }
++  } catch (error) {
++    if (error instanceof InvalidInstallMarkerError) {
++      throw error;
++    }
++    throw invalidMarker(markerPath, error);
++  }
++  return executablePath;
++}
++
++function isWithin(root: string, target: string): boolean {
++  const relativePath = path.relative(root, target);
++  return (
++    relativePath === '' ||
++    (!path.isAbsolute(relativePath) &&
++      relativePath !== '..' &&
++      !relativePath.startsWith(`..${path.sep}`))
++  );
++}
++
++function invalidMarker(
++  markerPath: string,
++  cause: unknown,
++): InvalidInstallMarkerError {
++  const detail = cause instanceof Error ? cause.message : String(cause);
++  return new InvalidInstallMarkerError(
++    `Invalid install marker at ${markerPath}: ${detail}`,
++  );
++}
++
++function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
++  return error instanceof Error && 'code' in error;
++}
+diff --git a/packages/browsers/src/installStaging.ts b/packages/browsers/src/installStaging.ts
+new file mode 100644
+index 00000000000..1303f87805a
+--- /dev/null
++++ b/packages/browsers/src/installStaging.ts
+@@ -0,0 +1,224 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import fs from 'node:fs';
++import {
++  link,
++  lstat,
++  mkdir,
++  mkdtemp,
++  rename,
++  rm,
++  unlink,
++} from 'node:fs/promises';
++import path from 'node:path';
++
++import {readInstallMarker} from './installMarker.js';
++
++const INSTALL_ATTEMPT_CLEANUP_MAX_RETRIES = 5;
++const INSTALL_ATTEMPT_CLEANUP_RETRY_DELAY = 100;
++
++/**
++ * @internal
++ */
++export class AmbiguousInstallPublicationError extends Error {}
++
++/**
++ * @internal
++ */
++export class InstallArchivePublicationError extends Error {}
++
++/**
++ * @internal
++ */
++export class InvalidInstallTreeError extends Error {}
++
++/**
++ * @internal
++ */
++export interface InstallAttempt {
++  path: string;
++  archivePath: string;
++  outputPath: string;
++}
++
++/**
++ * @internal
++ */
++export const internalConstantsForTesting: {
++  link: typeof link;
++  rm: (
++    path: string,
++    options: {
++      recursive: true;
++      force: true;
++      maxRetries: number;
++      retryDelay: number;
++    },
++  ) => Promise<void>;
++} = {
++  link,
++  rm,
++};
++
++/**
++ * @internal
++ */
++export async function createInstallAttempt(
++  browserRoot: string,
++  archiveSuffix = '',
++): Promise<InstallAttempt> {
++  await mkdir(browserRoot, {recursive: true});
++  const stagingRoot = path.join(browserRoot, '.staging');
++  await mkdir(stagingRoot, {recursive: true});
++  const stagingStat = await lstat(stagingRoot);
++  if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
++    throw new Error(`Staging path is not a regular directory: ${stagingRoot}`);
++  }
++  const attemptPath = await mkdtemp(path.join(stagingRoot, 'install-'));
++  return {
++    path: attemptPath,
++    archivePath: path.join(attemptPath, `archive${archiveSuffix}`),
++    outputPath: path.join(attemptPath, 'output'),
++  };
++}
++
++/**
++ * Publishes a completed install tree. A valid new-protocol winner is preserved
++ * and reported as `winner`.
++ *
++ * @internal
++ */
++export async function publishInstallTree(
++  outputPath: string,
++  installationDir: string,
++): Promise<'published' | 'winner'> {
++  const maxAttempts = process.platform === 'win32' ? 5 : 1;
++  for (let attempt = 1; ; attempt++) {
++    const existing = inspectPublicationWinner(installationDir);
++    if (existing) {
++      return existing;
++    }
++    try {
++      await rename(outputPath, installationDir);
++      return 'published';
++    } catch (error) {
++      const winner = inspectPublicationWinner(installationDir);
++      if (winner) {
++        return winner;
++      }
++      if (
++        attempt >= maxAttempts ||
++        !isWindowsRenameContentionError(error) ||
++        !(await isRegularDirectory(outputPath))
++      ) {
++        throw error;
++      }
++      await delay(attempt * 50);
++    }
++  }
++}
++
++/**
++ * Publishes a completed archive without replacing an existing canonical file.
++ *
++ * @internal
++ */
++export async function publishInstallArchive(
++  privateArchivePath: string,
++  archivePath: string,
++): Promise<void> {
++  try {
++    await internalConstantsForTesting.link(privateArchivePath, archivePath);
++  } catch (error) {
++    if (isErrnoException(error) && error.code === 'EEXIST') {
++      throw new AmbiguousInstallPublicationError(
++        `The archive ${archivePath} appeared while the installation was in progress. ` +
++          'Wait for the other installation to finish and retry.',
++      );
++    }
++    throw new InstallArchivePublicationError(
++      `Failed to publish the completed archive ${archivePath} using a hard link. ` +
++        'Archive-only installation requires hard-link support from the cache filesystem.',
++      {cause: error},
++    );
++  }
++  try {
++    await unlink(privateArchivePath);
++  } catch {
++    // The attempt cleanup removes the remaining private hard link. The
++    // canonical archive is already complete and must remain the primary result.
++  }
++}
++
++/**
++ * @internal
++ */
++export async function removeInstallAttempt(attemptPath: string): Promise<void> {
++  await internalConstantsForTesting.rm(attemptPath, {
++    recursive: true,
++    force: true,
++    maxRetries: INSTALL_ATTEMPT_CLEANUP_MAX_RETRIES,
++    retryDelay: INSTALL_ATTEMPT_CLEANUP_RETRY_DELAY,
++  });
++}
++
++function inspectPublicationWinner(
++  installationDir: string,
++): 'winner' | undefined {
++  let stat: fs.Stats;
++  try {
++    stat = fs.lstatSync(installationDir);
++  } catch (error) {
++    if (isErrnoException(error) && error.code === 'ENOENT') {
++      return;
++    }
++    throw error;
++  }
++  if (!stat.isDirectory() || stat.isSymbolicLink()) {
++    throw new InvalidInstallTreeError(
++      `Installation path is not a regular directory: ${installationDir}`,
++    );
++  }
++  const marker = readInstallMarker(installationDir);
++  if (marker) {
++    return 'winner';
++  }
++  throw new AmbiguousInstallPublicationError(
++    `The browser folder ${installationDir} appeared without an install marker ` +
++      'while the installation was in progress. Wait for the other installation ' +
++      'to finish and retry.',
++  );
++}
++
++async function isRegularDirectory(directoryPath: string): Promise<boolean> {
++  try {
++    const stat = await lstat(directoryPath);
++    return stat.isDirectory() && !stat.isSymbolicLink();
++  } catch {
++    return false;
++  }
++}
++
++function isWindowsRenameContentionError(error: unknown): boolean {
++  return (
++    process.platform === 'win32' &&
++    isErrnoException(error) &&
++    (error.code === 'EPERM' ||
++      error.code === 'EBUSY' ||
++      error.code === 'EACCES')
++  );
++}
++
++function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
++  return error instanceof Error && 'code' in error;
++}
++
++async function delay(milliseconds: number): Promise<void> {
++  await new Promise(resolve => {
++    setTimeout(resolve, milliseconds);
++  });
++}
+diff --git a/packages/browsers/src/provider.ts b/packages/browsers/src/provider.ts
+index 4002a235c6b..838a022612f 100644
+--- a/packages/browsers/src/provider.ts
++++ b/packages/browsers/src/provider.ts
+@@ -108,6 +108,8 @@ export interface BrowserProvider {
+ 
+   /**
+    * Get the relative path to the executable within the extracted archive.
++   * The path must remain valid when the extracted browser tree is moved to its
++   * final installation directory.
+    *
+    * @param options - Browser, buildId, and platform
+    * @returns Relative path to the executable
+diff --git a/packages/browsers/test/src/Cache.test.ts b/packages/browsers/test/src/Cache.test.ts
+index aacab2116fc..df6de8746d3 100644
+--- a/packages/browsers/test/src/Cache.test.ts
++++ b/packages/browsers/test/src/Cache.test.ts
+@@ -9,6 +9,9 @@ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+ 
++import sinon from 'sinon';
++
++import {writeInstallMarker} from '../../lib/installMarker.js';
+ import {Browser, BrowserPlatform, Cache} from '../../lib/main.js';
+ 
+ describe('Cache', () => {
+@@ -70,12 +73,348 @@ describe('Cache', () => {
+     );
+   });
+ 
++  it('prefers the executable path from the install marker', () => {
++    const buildId = '123.0.0.0';
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      buildId,
++    );
++    const relativeExecutablePath = path.join('custom', 'chrome');
++    const executablePath = path.join(installationDir, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, '');
++    cache.writeExecutablePath(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      buildId,
++      path.join('stale', 'chrome'),
++    );
++    writeInstallMarker(installationDir, relativeExecutablePath);
++
++    assert.strictEqual(
++      cache.computeExecutablePath({
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId,
++      }),
++      executablePath,
++    );
++  });
++
++  it('does not fall back when the install marker is invalid', () => {
++    const buildId = '123.0.0.0';
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      buildId,
++    );
++    fs.mkdirSync(installationDir, {recursive: true});
++    fs.writeFileSync(
++      path.join(installationDir, '.puppeteer-install'),
++      JSON.stringify({
++        version: 2,
++        relativeExecutablePath: path.join('custom', 'chrome'),
++      }),
++    );
++    cache.writeExecutablePath(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      buildId,
++      path.join('legacy', 'chrome'),
++    );
++
++    assert.throws(() => {
++      cache.computeExecutablePath({
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId,
++      });
++    }, /unsupported marker version/);
++  });
++
++  it('does not overwrite malformed global metadata during an update', () => {
++    const metadataPath = cache.metadataFile(Browser.CHROME);
++    fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
++    fs.writeFileSync(metadataPath, '{');
++
++    assert.throws(() => {
++      cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++    });
++    assert.strictEqual(fs.readFileSync(metadataPath, 'utf8'), '{');
++    assert.deepStrictEqual(fs.readdirSync(cache.browserRoot(Browser.CHROME)), [
++      '.metadata',
++    ]);
++  });
++
++  it('does not write metadata when a mutator throws', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123');
++    const failure = new Error('mutator failed');
++    assert.throws(
++      () => {
++        cache.updateMetadata(Browser.CHROME, metadata => {
++          metadata.aliases['stable'] = '456';
++          throw failure;
++        });
++      },
++      error => {
++        return error === failure;
++      },
++    );
++    assert.equal(cache.resolveAlias(Browser.CHROME, 'stable'), '123');
++    cache.writeAlias(Browser.CHROME, 'canary', '456');
++  });
++
++  it('does not replace metadata for a no-op update', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123');
++    const rename = sinon.spy(fs, 'renameSync');
++    try {
++      assert.equal(
++        cache.updateMetadata(Browser.CHROME, metadata => {
++          metadata.aliases['stable'] = '123';
++        }),
++        false,
++      );
++      assert.equal(
++        rename.getCalls().filter(call => {
++          return call.args[1] === cache.metadataFile(Browser.CHROME);
++        }).length,
++        0,
++      );
++      assert.deepStrictEqual(
++        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++        ['.metadata'],
++      );
++    } finally {
++      rename.restore();
++    }
++  });
++
++  it('removes aliases during uninstall even without an executable-path override', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123');
++    cache.writeAlias(Browser.CHROME, 'canary', '456');
++    cache.uninstall(Browser.CHROME, BrowserPlatform.WIN64, '123');
++    assert.deepStrictEqual(cache.readMetadata(Browser.CHROME), {
++      aliases: {canary: '456'},
++    });
++  });
++
++  it('preserves metadata and removes the temp file when rename fails', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++    const metadataPath = cache.metadataFile(Browser.CHROME);
++    const previousMetadata = fs.readFileSync(metadataPath);
++    const renameError = new Error('rename failed');
++    const filesystemRename = sinon.stub(fs, 'renameSync').callThrough();
++    filesystemRename
++      .withArgs(sinon.match.any, metadataPath)
++      .throws(renameError);
++
++    try {
++      assert.throws(
++        () => {
++          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0');
++        },
++        error => {
++          assert.strictEqual(error, renameError);
++          return true;
++        },
++      );
++      assert.deepStrictEqual(fs.readFileSync(metadataPath), previousMetadata);
++      assert.deepStrictEqual(
++        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++        ['.metadata'],
++      );
++    } finally {
++      filesystemRename.restore();
++    }
++  });
++
++  it('leaves no metadata temp file after an atomic update', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++
++    assert.deepStrictEqual(fs.readdirSync(cache.browserRoot(Browser.CHROME)), [
++      '.metadata',
++    ]);
++  });
++
++  for (const code of ['EPERM', 'EBUSY', 'EACCES']) {
++    it(`retries transient ${code} while replacing metadata on Windows`, () => {
++      cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++      const metadataPath = cache.metadataFile(Browser.CHROME);
++      const previousMetadata = fs.readFileSync(metadataPath);
++      const renameSync = fs.renameSync;
++      const renameError = Object.assign(new Error('rename contention'), {code});
++      const sandbox = sinon.createSandbox();
++      try {
++        sandbox.stub(process, 'platform').value('win32');
++        const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
++        const filesystemRename = sandbox.stub(fs, 'renameSync').callThrough();
++        const rename = filesystemRename
++          .withArgs(sinon.match.any, cache.metadataFile(Browser.CHROME))
++          .callsFake((from, to) => {
++            assert.ok(fs.existsSync(from));
++            assert.deepStrictEqual(fs.readFileSync(to), previousMetadata);
++            if (rename.callCount < 3) {
++              throw renameError;
++            }
++            renameSync(from, to);
++          });
++
++        assert.strictEqual(
++          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0'),
++          undefined,
++        );
++        assert.strictEqual(rename.callCount, 3);
++        assert.deepStrictEqual(rename.secondCall.args, rename.firstCall.args);
++        assert.deepStrictEqual(rename.thirdCall.args, rename.firstCall.args);
++        assert.deepStrictEqual(
++          wait.getCalls().map(call => {
++            return call.args[3];
++          }),
++          [50, 100],
++        );
++        assert.strictEqual(
++          cache.readMetadata(Browser.CHROME).aliases['stable'],
++          '124.0.0.0',
++        );
++        assert.deepStrictEqual(
++          fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++          ['.metadata'],
++        );
++      } finally {
++        sandbox.restore();
++      }
++    });
++  }
++
++  it('bounds Windows rename retries and preserves the last error and metadata', () => {
++    cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++    const metadataPath = cache.metadataFile(Browser.CHROME);
++    const previousMetadata = fs.readFileSync(metadataPath);
++    const errors = Array.from({length: 5}, (_, index) => {
++      return Object.assign(new Error(`rename failure ${index}`), {
++        code: 'EPERM',
++      });
++    });
++    const sandbox = sinon.createSandbox();
++    try {
++      sandbox.stub(process, 'platform').value('win32');
++      const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
++      const filesystemRename = sandbox.stub(fs, 'renameSync').callThrough();
++      const rename = filesystemRename
++        .withArgs(sinon.match.any, cache.metadataFile(Browser.CHROME))
++        .callsFake((from, to) => {
++          assert.ok(fs.existsSync(from));
++          assert.deepStrictEqual(fs.readFileSync(to), previousMetadata);
++          throw errors[rename.callCount - 1];
++        });
++
++      assert.throws(
++        () => {
++          cache.writeAlias(Browser.CHROME, 'stable', '124.0.0.0');
++        },
++        error => {
++          assert.strictEqual(error, errors[4]);
++          return true;
++        },
++      );
++      assert.strictEqual(rename.callCount, 5);
++      assert.deepStrictEqual(
++        wait.getCalls().map(call => {
++          return call.args[3];
++        }),
++        [50, 100, 150, 200],
++      );
++      assert.ok(
++        rename.getCalls().every(call => {
++          return call.args[0] === rename.firstCall.args[0];
++        }),
++      );
++      assert.deepStrictEqual(fs.readFileSync(metadataPath), previousMetadata);
++      assert.deepStrictEqual(
++        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++        ['.metadata'],
++      );
++    } finally {
++      sandbox.restore();
++    }
++  });
++
++  it('does not retry other Windows rename errors', () => {
++    const sandbox = sinon.createSandbox();
++    const renameError = Object.assign(new Error('I/O failure'), {code: 'EIO'});
++    try {
++      sandbox.stub(process, 'platform').value('win32');
++      const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
++      const filesystemRename = sandbox.stub(fs, 'renameSync').callThrough();
++      const rename = filesystemRename
++        .withArgs(sinon.match.any, cache.metadataFile(Browser.CHROME))
++        .throws(renameError);
++      assert.throws(
++        () => {
++          cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++        },
++        error => {
++          assert.strictEqual(error, renameError);
++          return true;
++        },
++      );
++      assert.strictEqual(rename.callCount, 1);
++      assert.strictEqual(wait.callCount, 0);
++      assert.deepStrictEqual(
++        fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++        [],
++      );
++    } finally {
++      sandbox.restore();
++    }
++  });
++
++  for (const platform of ['linux', 'darwin']) {
++    it(`does not retry metadata rename errors on ${platform}`, () => {
++      const sandbox = sinon.createSandbox();
++      const renameError = Object.assign(new Error('rename denied'), {
++        code: 'EPERM',
++      });
++      try {
++        sandbox.stub(process, 'platform').value(platform);
++        const wait = sandbox.stub(Atomics, 'wait').returns('timed-out');
++        const filesystemRename = sandbox.stub(fs, 'renameSync').callThrough();
++        const rename = filesystemRename
++          .withArgs(sinon.match.any, cache.metadataFile(Browser.CHROME))
++          .throws(renameError);
++        assert.throws(
++          () => {
++            cache.writeAlias(Browser.CHROME, 'stable', '123.0.0.0');
++          },
++          error => {
++            assert.strictEqual(error, renameError);
++            return true;
++          },
++        );
++        assert.strictEqual(rename.callCount, 1);
++        assert.strictEqual(wait.callCount, 0);
++        assert.deepStrictEqual(
++          fs.readdirSync(cache.browserRoot(Browser.CHROME)),
++          [],
++        );
++      } finally {
++        sandbox.restore();
++      }
++    });
++  }
+   it('prevents path traversal in installationDir and uninstall', () => {
+     const siblingDir = fs.mkdtempSync(
+       path.join(os.tmpdir(), 'puppeteer-browsers-sibling'),
+     );
+     try {
+       const traversalBuildId = `../../../../${path.relative('/', siblingDir)}`;
++      cache.writeMetadata(Browser.CHROME, {
++        aliases: {stable: traversalBuildId},
++      });
++      const metadataBefore = fs.readFileSync(
++        cache.metadataFile(Browser.CHROME),
++      );
+       assert.throws(() => {
+         cache.installationDir(
+           Browser.CHROME,
+@@ -101,6 +440,10 @@ describe('Cache', () => {
+       }, /Invalid buildId/);
+ 
+       assert.strictEqual(fs.existsSync(siblingDir), true);
++      assert.deepStrictEqual(
++        fs.readFileSync(cache.metadataFile(Browser.CHROME)),
++        metadataBefore,
++      );
+     } finally {
+       fs.rmSync(siblingDir, {recursive: true, force: true});
+     }
+diff --git a/packages/browsers/test/src/fileUtil.test.ts b/packages/browsers/test/src/fileUtil.test.ts
+index b5f48f9887b..5343c535052 100644
+--- a/packages/browsers/test/src/fileUtil.test.ts
++++ b/packages/browsers/test/src/fileUtil.test.ts
+@@ -5,100 +5,23 @@
+  */
+ 
+ import assert from 'node:assert';
++import childProcess from 'node:child_process';
+ import fs from 'node:fs';
++import {syncBuiltinESMExports} from 'node:module';
+ import os from 'node:os';
+ import path from 'node:path';
+-import zlib from 'node:zlib';
++
++import sinon from 'sinon';
++import yauzl from 'yauzl';
+ 
+ import {
+   extractZipWithYauzl,
+   internalConstantsForTesting,
+   unpackArchive,
++  unpackArchiveWithCleanupState,
+ } from '../../lib/fileUtil.js';
+ 
+-interface TestZipEntry {
+-  name: string;
+-  type?: 'file' | 'dir' | 'symlink';
+-  content?: string;
+-  mode?: number;
+-}
+-
+-/**
+- * Writes an uncompressed (STORE) PKZIP archive with Unix external file
+- * attributes for testing zip extraction on the fly.
+- */
+-function createTestZip(zipPath: string, entries: TestZipEntry[]): string {
+-  const localParts: Buffer[] = [];
+-  const centralParts: Buffer[] = [];
+-  let localOffset = 0;
+-
+-  for (const entry of entries) {
+-    const nameBuf = Buffer.from(entry.name, 'utf8');
+-    const dataBuf = Buffer.from(entry.content ?? '', 'utf8');
+-    const crc = zlib.crc32(dataBuf);
+-    const kind = entry.type ?? (entry.name.endsWith('/') ? 'dir' : 'file');
+-    const fileTypeBits =
+-      kind === 'symlink'
+-        ? fs.constants.S_IFLNK
+-        : kind === 'dir'
+-          ? fs.constants.S_IFDIR
+-          : fs.constants.S_IFREG;
+-    const permBits =
+-      entry.mode ??
+-      (kind === 'symlink' ? 0o777 : kind === 'dir' ? 0o755 : 0o644);
+-    const unixMode = fileTypeBits | permBits;
+-
+-    const localHeader = Buffer.alloc(30);
+-    localHeader.writeUInt32LE(0x04034b50, 0);
+-    localHeader.writeUInt16LE(20, 4);
+-    localHeader.writeUInt16LE(0x0800, 6);
+-    localHeader.writeUInt16LE(0, 8);
+-    localHeader.writeUInt16LE(0, 10);
+-    localHeader.writeUInt16LE(0x0021, 12);
+-    localHeader.writeUInt32LE(crc, 14);
+-    localHeader.writeUInt32LE(dataBuf.length, 18);
+-    localHeader.writeUInt32LE(dataBuf.length, 22);
+-    localHeader.writeUInt16LE(nameBuf.length, 26);
+-    localHeader.writeUInt16LE(0, 28);
+-    localParts.push(localHeader, nameBuf, dataBuf);
+-
+-    const centralHeader = Buffer.alloc(46);
+-    centralHeader.writeUInt32LE(0x02014b50, 0);
+-    centralHeader.writeUInt16LE((3 << 8) | 20, 4);
+-    centralHeader.writeUInt16LE(20, 6);
+-    centralHeader.writeUInt16LE(0x0800, 8);
+-    centralHeader.writeUInt16LE(0, 10);
+-    centralHeader.writeUInt16LE(0, 12);
+-    centralHeader.writeUInt16LE(0x0021, 14);
+-    centralHeader.writeUInt32LE(crc, 16);
+-    centralHeader.writeUInt32LE(dataBuf.length, 20);
+-    centralHeader.writeUInt32LE(dataBuf.length, 24);
+-    centralHeader.writeUInt16LE(nameBuf.length, 28);
+-    centralHeader.writeUInt16LE(0, 30);
+-    centralHeader.writeUInt16LE(0, 32);
+-    centralHeader.writeUInt16LE(0, 34);
+-    centralHeader.writeUInt16LE(0, 36);
+-    centralHeader.writeUInt32LE((unixMode << 16) >>> 0, 38);
+-    centralHeader.writeUInt32LE(localOffset, 42);
+-    centralParts.push(centralHeader, nameBuf);
+-
+-    localOffset += localHeader.length + nameBuf.length + dataBuf.length;
+-  }
+-
+-  const centralDir = Buffer.concat(centralParts);
+-  const eocd = Buffer.alloc(22);
+-  eocd.writeUInt32LE(0x06054b50, 0);
+-  eocd.writeUInt16LE(0, 4);
+-  eocd.writeUInt16LE(0, 6);
+-  eocd.writeUInt16LE(entries.length, 8);
+-  eocd.writeUInt16LE(entries.length, 10);
+-  eocd.writeUInt32LE(centralDir.length, 12);
+-  eocd.writeUInt32LE(localOffset, 16);
+-  eocd.writeUInt16LE(0, 20);
+-
+-  fs.writeFileSync(zipPath, Buffer.concat([...localParts, centralDir, eocd]));
+-  return zipPath;
+-}
++import {createTestZip, testZipEntries, type TestZipEntry} from './zip.js';
+ 
+ describe('fileUtil', function () {
+   let tmpDir = '/tmp/puppeteer-browsers-test';
+@@ -160,18 +83,6 @@ describe('fileUtil', function () {
+     assert.deepStrictEqual(dir, []);
+   }
+ 
+-  const testZipEntries: TestZipEntry[] = [
+-    {name: 'browser/', type: 'dir'},
+-    {name: 'browser/locales/', type: 'dir'},
+-    {name: 'browser/locales/en-US.pak', content: 'resource', mode: 0o644},
+-    {
+-      name: 'browser/chrome',
+-      content: '#!/bin/sh\necho chrome\n',
+-      mode: 0o755,
+-    },
+-    {name: 'browser/product_logo.png', content: 'logo', mode: 0o644},
+-  ];
+-
+   function assertTestZipUnpacked(targetDir: string): void {
+     const entries = fs
+       .readdirSync(targetDir, {recursive: true})
+@@ -235,6 +146,10 @@ describe('fileUtil', function () {
+   });
+ 
+   describe('extractZipWithYauzl', () => {
++    afterEach(() => {
++      sinon.restore();
++    });
++
+     it('extracts every entry with its structure and contents', async () => {
+       const archivePath = createTestZip(
+         path.join(tmpDir, 'test.zip'),
+@@ -245,6 +160,39 @@ describe('fileUtil', function () {
+       assertTestZipUnpacked(targetDir);
+     });
+ 
++    it('resolves after closing the archive', async () => {
++      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
++      const archivePath = path.join(tmpDir, 'archive.zip');
++      const renamedPath = path.join(tmpDir, 'closed.zip');
++      const outputPath = path.join(tmpDir, 'output');
++      createTestZip(archivePath, testZipEntries);
++
++      await extractZipWithYauzl(archivePath, outputPath);
++      assert.ok(events.calledWith('close'), 'archive was not closed');
++      fs.renameSync(archivePath, renamedPath);
++    });
++
++    it('closes the archive after an entry write fails', async () => {
++      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
++      const outputPath = path.join(tmpDir, 'output');
++      const blockedFile = path.join(outputPath, 'browser', 'chrome');
++      fs.mkdirSync(blockedFile, {recursive: true});
++
++      await assert.rejects(
++        extractZipWithYauzl(
++          createTestZip(path.join(tmpDir, 'archive.zip'), testZipEntries),
++          outputPath,
++        ),
++        (error: unknown) => {
++          const {cause} = error as {cause?: NodeJS.ErrnoException};
++          assert.strictEqual(cause?.code, 'EISDIR');
++          return true;
++        },
++      );
++      assert.ok(events.calledWith('close'), 'archive was not closed');
++      assert.ok(fs.statSync(blockedFile).isDirectory());
++    });
++
+     // Node.js does not honor POSIX permission bits on Windows.
+     (os.platform() === 'win32' ? it.skip : it)(
+       'preserves owner permissions',
+@@ -284,6 +232,8 @@ describe('fileUtil', function () {
+     // The target is validated before any symlink is created, so unlike the
+     // preceding symlink test the rejection can be checked on Windows too.
+     it('rejects symlinks that point outside the target directory', async () => {
++      const events = sinon.spy(yauzl.ZipFile.prototype, 'emit');
++      const renamedPath = path.join(tmpDir, 'closed-escape.zip');
+       const archivePath = createTestZip(
+         path.join(tmpDir, 'test-symlink-escape.zip'),
+         [
+@@ -305,10 +255,12 @@ describe('fileUtil', function () {
+           return true;
+         },
+       );
++      assert.ok(events.calledWith('close'), 'archive was not closed');
+       assert.ok(
+         !fs.existsSync(path.join(targetDir, 'browser', 'evil-link')),
+         'symlink pointing outside the target directory was created',
+       );
++      fs.renameSync(archivePath, renamedPath);
+     });
+ 
+     const frameworkEntries: TestZipEntry[] = [
+@@ -502,6 +454,222 @@ describe('fileUtil', function () {
+     }
+   });
+ 
++  describe('DMG cleanup', () => {
++    const originalDmgExecFile = internalConstantsForTesting.dmgExecFile;
++    const originalDmgReaddir = internalConstantsForTesting.dmgReaddir;
++    const originalDelay = internalConstantsForTesting.delay;
++    const originalDetachAttempts =
++      internalConstantsForTesting.dmgDetachAttempts;
++    const originalDetachRetryDelay =
++      internalConstantsForTesting.dmgDetachRetryDelay;
++
++    afterEach(() => {
++      internalConstantsForTesting.dmgExecFile = originalDmgExecFile;
++      internalConstantsForTesting.dmgReaddir = originalDmgReaddir;
++      internalConstantsForTesting.delay = originalDelay;
++      internalConstantsForTesting.dmgDetachAttempts = originalDetachAttempts;
++      internalConstantsForTesting.dmgDetachRetryDelay =
++        originalDetachRetryDelay;
++    });
++
++    it('retries detach and reports a released mount after a transient failure', async () => {
++      let detachCalls = 0;
++      let delayCalls = 0;
++      internalConstantsForTesting.dmgReaddir = async () => {
++        return ['Browser.app'];
++      };
++      internalConstantsForTesting.delay = async () => {
++        ++delayCalls;
++      };
++      internalConstantsForTesting.dmgExecFile = async (file, args) => {
++        if (file === 'cp') {
++          return {stdout: '', stderr: ''};
++        }
++        if (args[0] === 'attach') {
++          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++        }
++        if (args[0] === 'detach') {
++          if (++detachCalls < 3) {
++            throw new Error('resource busy');
++          }
++          return {stdout: '', stderr: ''};
++        }
++        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++      };
++
++      const outcome = await unpackArchiveWithCleanupState(
++        path.join(tmpDir, 'browser.dmg'),
++        path.join(tmpDir, 'output'),
++      );
++
++      assert.deepStrictEqual(outcome, {
++        status: 'success',
++        isSafeToCleanup: true,
++      });
++      assert.strictEqual(detachCalls, 3);
++      assert.strictEqual(delayCalls, 2);
++    });
++
++    it('preserves copy success when detach retries are exhausted', async () => {
++      let detachCalls = 0;
++      const messages: string[] = [];
++      internalConstantsForTesting.dmgReaddir = async () => {
++        return ['Browser.app'];
++      };
++      internalConstantsForTesting.delay = async () => {};
++      internalConstantsForTesting.dmgExecFile = async (file, args) => {
++        if (file === 'cp') {
++          return {stdout: '', stderr: ''};
++        }
++        if (args[0] === 'attach') {
++          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++        }
++        if (args[0] === 'detach') {
++          ++detachCalls;
++          throw new Error('resource busy');
++        }
++        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++      };
++
++      const outcome = await unpackArchiveWithCleanupState(
++        path.join(tmpDir, 'browser.dmg'),
++        path.join(tmpDir, 'output'),
++        () => {
++          return (...args: unknown[]) => {
++            messages.push(args.join(' '));
++          };
++        },
++      );
++
++      assert.deepStrictEqual(outcome, {
++        status: 'success',
++        isSafeToCleanup: false,
++      });
++      assert.strictEqual(detachCalls, 3);
++      assert.ok(
++        messages.some(message => {
++          return message.includes('Retaining DMG mount');
++        }),
++      );
++    });
++
++    it('preserves the copy error when detach retries are exhausted', async () => {
++      const copyError = new Error('copy failed');
++      let detachCalls = 0;
++      internalConstantsForTesting.dmgReaddir = async () => {
++        return ['Browser.app'];
++      };
++      internalConstantsForTesting.delay = async () => {};
++      internalConstantsForTesting.dmgExecFile = async (file, args) => {
++        if (file === 'cp') {
++          throw copyError;
++        }
++        if (args[0] === 'attach') {
++          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++        }
++        if (args[0] === 'detach') {
++          ++detachCalls;
++          throw new Error('resource busy');
++        }
++        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++      };
++
++      const outcome = await unpackArchiveWithCleanupState(
++        path.join(tmpDir, 'browser.dmg'),
++        path.join(tmpDir, 'output'),
++      );
++
++      assert.strictEqual(outcome.status, 'error');
++      if (outcome.status === 'error') {
++        assert.strictEqual(outcome.error, copyError);
++      }
++      assert.strictEqual(outcome.isSafeToCleanup, false);
++      assert.strictEqual(detachCalls, 3);
++    });
++
++    it('reports a failed copy as cleanup-safe after detach succeeds', async () => {
++      const copyError = new Error('copy failed');
++      internalConstantsForTesting.dmgReaddir = async () => {
++        return ['Browser.app'];
++      };
++      internalConstantsForTesting.dmgExecFile = async (file, args) => {
++        if (file === 'cp') {
++          throw copyError;
++        }
++        if (args[0] === 'attach') {
++          return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++        }
++        if (args[0] === 'detach') {
++          return {stdout: '', stderr: ''};
++        }
++        throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++      };
++
++      const outcome = await unpackArchiveWithCleanupState(
++        path.join(tmpDir, 'browser.dmg'),
++        path.join(tmpDir, 'output'),
++      );
++
++      assert.strictEqual(outcome.status, 'error');
++      if (outcome.status === 'error') {
++        assert.strictEqual(outcome.error, copyError);
++      }
++      assert.strictEqual(outcome.isSafeToCleanup, true);
++    });
++  });
++
++  it('stops the decompressor and waits for close after a tar pipeline failure', async () => {
++    const spawn = childProcess.spawn;
++    // Keep the producer alive after emitting an invalid tar header so the
++    // output pipeline failure must stop it. The timer bounds a broken test.
++    const producer = spawn(process.execPath, [
++      '-e',
++      "process.stdin.resume(); process.stdout.write(Buffer.alloc(512, 'x')); setTimeout(() => process.exit(0), 5000);",
++    ]);
++    let closed = false;
++    const childClosed = new Promise<void>(resolve => {
++      producer.once('close', () => {
++        closed = true;
++        resolve();
++      });
++    });
++    const kill = sinon.spy(producer, 'kill');
++    const spawnStub = sinon.stub(childProcess, 'spawn').returns(producer);
++    syncBuiltinESMExports();
++    try {
++      const outcome = await unpackArchiveWithCleanupState(
++        path.join(fixturesPath, 'test.tar.xz'),
++        path.join(tmpDir, 'output'),
++      );
++
++      assert.strictEqual(outcome.status, 'error');
++      assert.ok(kill.called, 'producer was not stopped');
++      assert.ok(closed, 'extraction settled before the producer closed');
++      assert.strictEqual(outcome.isSafeToCleanup, true);
++    } finally {
++      spawnStub.restore();
++      syncBuiltinESMExports();
++      kill.restore();
++      if (!closed) {
++        producer.kill();
++      }
++      await childClosed;
++    }
++  });
++
++  it('rejects a non-zero decompressor after closing the archive', async () => {
++    const archivePath = path.join(tmpDir, 'input.tar.xz');
++    const renamedPath = path.join(tmpDir, 'closed.tar.xz');
++    const outputPath = path.join(tmpDir, 'output');
++    // xz rejects this input before producing any tar data.
++    fs.writeFileSync(archivePath, 'not an xz archive');
++    await assert.rejects(
++      unpackArchive(archivePath, outputPath),
++      /`xz` exited with code 1/,
++    );
++    fs.renameSync(archivePath, renamedPath);
++  });
++
+   it('throws an error if xz is not found', async () => {
+     internalConstantsForTesting.xz = 'xz-not-existent';
+     try {
+diff --git a/packages/browsers/test/src/httpUtil.test.ts b/packages/browsers/test/src/httpUtil.test.ts
+index 62596ca62d7..14dc41b39e9 100644
+--- a/packages/browsers/test/src/httpUtil.test.ts
++++ b/packages/browsers/test/src/httpUtil.test.ts
+@@ -6,6 +6,7 @@
+ 
+ import assert from 'node:assert';
+ import {createHash} from 'node:crypto';
++import {once} from 'node:events';
+ import fs from 'node:fs';
+ import http from 'node:http';
+ import os from 'node:os';
+@@ -17,13 +18,28 @@ describe('downloadFile', function () {
+   let tmpDir: string;
+   let server: http.Server;
+   let serverUrl: URL;
++  let streamingResponse: http.ServerResponse;
+ 
+   const testContent = Buffer.from('test browser binary content');
+   const correctHash = createHash('sha256').update(testContent).digest('hex');
+ 
+   beforeEach(async () => {
+     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-httputil-test'));
+-    server = http.createServer((_req, res) => {
++    server = http.createServer((req, res) => {
++      if (req.url === '/streaming') {
++        streamingResponse = res;
++        res.writeHead(200, {'Content-Length': String(testContent.length * 2)});
++        res.write(testContent.subarray(0, 4));
++        return;
++      }
++      if (req.url === '/aborted') {
++        res.writeHead(200, {'Content-Length': String(testContent.length * 2)});
++        res.write(testContent.subarray(0, 4));
++        setImmediate(() => {
++          res.destroy();
++        });
++        return;
++      }
+       res.writeHead(200, {'Content-Length': String(testContent.length)});
+       res.end(testContent);
+     });
+@@ -35,6 +51,7 @@ describe('downloadFile', function () {
+   });
+ 
+   afterEach(async () => {
++    server.closeAllConnections();
+     await new Promise<void>(resolve => {
+       server.close(() => {
+         return resolve();
+@@ -293,4 +310,87 @@ describe('downloadFile', function () {
+     );
+     assert.ok(fs.existsSync(destPath));
+   });
++
++  it('preserves a progress callback error and tears down the transfer', async () => {
++    const destPath = path.join(tmpDir, 'download.bin');
++    const progressError = new Error('progress callback failed');
++    let progressCalls = 0;
++
++    await assert.rejects(
++      downloadFile(
++        new URL('/streaming', serverUrl),
++        destPath,
++        () => {
++          ++progressCalls;
++          throw progressError;
++        },
++        correctHash,
++      ),
++      (error: unknown) => {
++        assert.strictEqual(error, progressError);
++        return true;
++      },
++    );
++
++    assert.strictEqual(progressCalls, 1);
++    assert.strictEqual(fs.existsSync(destPath), false);
++    if (!streamingResponse.destroyed) {
++      await once(streamingResponse, 'close', {
++        signal: AbortSignal.timeout(1000),
++      });
++    }
++    assert.strictEqual(streamingResponse.destroyed, true);
++  });
++
++  it('rejects an interrupted response after closing the destination', async () => {
++    const destPath = path.join(tmpDir, 'download.bin');
++    const interruptedUrl = new URL('/aborted', serverUrl);
++
++    await assert.rejects(() => {
++      return downloadFile(interruptedUrl, destPath);
++    });
++
++    assert.strictEqual(fs.existsSync(destPath), false);
++  });
++});
++
++describe('HTTP request errors', () => {
++  let server: http.Server;
++  let redirectUrl: URL;
++
++  beforeEach(async () => {
++    server = http.createServer((req, res) => {
++      if (req.url === '/redirect') {
++        res.writeHead(302, {
++          Location: '/reset',
++        });
++        res.end();
++        return;
++      }
++      // Fail the redirected request before sending any response headers.
++      req.socket.destroy();
++    });
++    await new Promise<void>(resolve => {
++      server.listen(0, '127.0.0.1', resolve);
++    });
++    const address = server.address() as {port: number};
++    redirectUrl = new URL(`http://127.0.0.1:${address.port}/redirect`);
++  });
++
++  afterEach(async () => {
++    server.closeAllConnections();
++    await new Promise<void>(resolve => {
++      server.close(() => {
++        resolve();
++      });
++    });
++  });
++
++  it('rejects getText when a relatively redirected request fails', async () => {
++    await assert.rejects(getText(redirectUrl), {code: 'ECONNRESET'});
++  });
++
++  it('resolves HEAD as false when a relatively redirected request fails', async () => {
++    assert.strictEqual(await headHttpRequest(redirectUrl), false);
++  });
+ });
+diff --git a/packages/browsers/test/src/install.test.ts b/packages/browsers/test/src/install.test.ts
+new file mode 100644
+index 00000000000..86d94ca5502
+--- /dev/null
++++ b/packages/browsers/test/src/install.test.ts
+@@ -0,0 +1,598 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import assert from 'node:assert';
++import fs from 'node:fs';
++import http from 'node:http';
++import type {AddressInfo} from 'node:net';
++import os from 'node:os';
++import path from 'node:path';
++
++import {executablePathByBrowser} from '../../lib/browser-data/browser-data.js';
++import {internalConstantsForTesting as fileUtilConstants} from '../../lib/fileUtil.js';
++import {IncompleteInstallationError} from '../../lib/install.js';
++import {
++  INSTALL_MARKER_FILE,
++  writeInstallMarker,
++} from '../../lib/installMarker.js';
++import {internalConstantsForTesting} from '../../lib/installStaging.js';
++import {
++  Browser,
++  BrowserPlatform,
++  Cache,
++  install,
++  type BrowserProvider,
++  type DownloadOptions,
++} from '../../lib/main.js';
++
++import {createTestZipBuffer, testZipEntries} from './zip.js';
++
++describe('install', () => {
++  let tmpDir: string;
++  let archive: Buffer;
++  let server: http.Server;
++  let serverUrl: URL;
++
++  before(async () => {
++    archive = createTestZipBuffer(testZipEntries);
++    server = http.createServer((request, response) => {
++      if (request.url === '/invalid.zip') {
++        response.writeHead(200, {'content-length': 7});
++        response.end('invalid');
++        return;
++      }
++      if (request.url !== '/test.zip' && request.url !== '/test.dmg') {
++        response.writeHead(404).end();
++        return;
++      }
++      response.writeHead(200, {'content-length': archive.length});
++      response.end(archive);
++    });
++    await new Promise<void>(resolve => {
++      server.listen(0, '127.0.0.1', resolve);
++    });
++    const address = server.address() as AddressInfo;
++    serverUrl = new URL(`http://127.0.0.1:${address.port}/test.zip`);
++  });
++
++  after(async () => {
++    await new Promise<void>((resolve, reject) => {
++      server.close(error => {
++        if (error) {
++          reject(error);
++          return;
++        }
++        resolve();
++      });
++    });
++  });
++
++  beforeEach(() => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-staging-'));
++  });
++
++  afterEach(() => {
++    fs.rmSync(tmpDir, {
++      recursive: true,
++      force: true,
++      maxRetries: 10,
++      retryDelay: 500,
++    });
++  });
++
++  it('publishes a completed tree with an install marker', async () => {
++    const provider = new TestProvider(serverUrl);
++
++    const installedBrowser = await install({
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      buildIdAlias: 'latest',
++      providers: [provider],
++      baseUrl: serverUrl.origin,
++    });
++
++    assert.strictEqual(
++      fs.readFileSync(installedBrowser.executablePath, 'utf8'),
++      '#!/bin/sh\necho chrome\n',
++    );
++    assert.deepStrictEqual(
++      JSON.parse(
++        fs.readFileSync(
++          path.join(installedBrowser.path, INSTALL_MARKER_FILE),
++          'utf8',
++        ),
++      ),
++      {version: 1, relativeExecutablePath: path.join('browser', 'chrome')},
++    );
++    assert.deepStrictEqual(
++      fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')),
++      [],
++    );
++    assert.strictEqual(
++      new Cache(tmpDir).readExecutablePath(
++        Browser.CHROME,
++        BrowserPlatform.LINUX,
++        '123',
++      ),
++      path.join('browser', 'chrome'),
++    );
++    assert.strictEqual(
++      new Cache(tmpDir).resolveAlias(Browser.CHROME, 'latest'),
++      '123',
++    );
++  });
++
++  it('uses the install marker on a cache hit without asking for a new executable path', async () => {
++    const provider = new TestProvider(serverUrl);
++    const options = {
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      providers: [provider],
++      baseUrl: serverUrl.origin,
++    };
++    const first = await install(options);
++    const second = await install(options);
++
++    assert.strictEqual(second.executablePath, first.executablePath);
++    assert.strictEqual(provider.executablePathCalls, 1);
++  });
++
++  it('converges concurrent installs on a completed tree', async () => {
++    const firstProvider = new TestProvider(serverUrl);
++    const secondProvider = new TestProvider(serverUrl);
++    const options = {
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      baseUrl: serverUrl.origin,
++    };
++
++    const [first, second] = await Promise.all([
++      install({...options, providers: [firstProvider]}),
++      install({...options, providers: [secondProvider]}),
++    ]);
++
++    assert.strictEqual(first.path, second.path);
++    assert.strictEqual(
++      fs.readFileSync(first.executablePath, 'utf8'),
++      '#!/bin/sh\necho chrome\n',
++    );
++    assert.deepStrictEqual(
++      fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')),
++      [],
++    );
++  });
++
++  it('rejects an invalid build ID before creating an archive download attempt', async () => {
++    const provider = new TestProvider(serverUrl);
++
++    await assert.rejects(
++      install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '../outside',
++        providers: [provider],
++        baseUrl: serverUrl.origin,
++        unpack: false,
++      }),
++      /Invalid buildId/,
++    );
++
++    assert.deepStrictEqual(
++      fs.readdirSync(path.join(tmpDir, Browser.CHROME)),
++      [],
++    );
++    assert.strictEqual(provider.executablePathCalls, 0);
++  });
++
++  it('publishes an archive without exposing the private download path', async () => {
++    const archivePath = await install({
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      providers: [new TestProvider(serverUrl)],
++      baseUrl: serverUrl.origin,
++      unpack: false,
++    });
++
++    assert.deepStrictEqual(fs.readFileSync(archivePath), archive);
++    assert.deepStrictEqual(
++      fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')),
++      [],
++    );
++  });
++
++  it('accepts a legacy installation without backfilling a marker', async () => {
++    const cache = new Cache(tmpDir);
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const relativeExecutablePath = path.join('browser', 'chrome');
++    const executablePath = path.join(installationDir, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, 'legacy');
++    cache.writeExecutablePath(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++      relativeExecutablePath,
++    );
++
++    const installedBrowser = await install({
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      providers: [new TestProvider(serverUrl)],
++      baseUrl: serverUrl.origin,
++    });
++
++    assert.strictEqual(installedBrowser.executablePath, executablePath);
++    assert.strictEqual(
++      fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),
++      false,
++    );
++  });
++
++  it('removes a stale global custom path for a new default-layout tree', async () => {
++    const cache = new Cache(tmpDir);
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const relativeExecutablePath = executablePathByBrowser[Browser.CHROME](
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const executablePath = path.join(installationDir, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, 'browser');
++    writeInstallMarker(installationDir, relativeExecutablePath);
++    cache.writeExecutablePath(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++      path.join('stale', 'browser'),
++    );
++
++    await install({
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      providers: [new TestProvider(serverUrl)],
++      baseUrl: serverUrl.origin,
++    });
++
++    assert.strictEqual(
++      cache.readExecutablePath(Browser.CHROME, BrowserPlatform.LINUX, '123'),
++      null,
++    );
++  });
++
++  it('treats an invalid install marker as terminal without provider fallback', async () => {
++    const cache = new Cache(tmpDir);
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    fs.mkdirSync(installationDir, {recursive: true});
++    fs.writeFileSync(
++      path.join(installationDir, INSTALL_MARKER_FILE),
++      JSON.stringify({
++        version: 2,
++        relativeExecutablePath: path.join('browser', 'chrome'),
++      }),
++    );
++    const firstProvider = new TestProvider(serverUrl);
++    const secondProvider = new TestProvider(serverUrl);
++
++    await assert.rejects(
++      install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [firstProvider, secondProvider],
++        baseUrl: serverUrl.origin,
++      }),
++      IncompleteInstallationError,
++    );
++    assert.strictEqual(firstProvider.supportsCalls, 1);
++    assert.strictEqual(secondProvider.supportsCalls, 0);
++    assert.strictEqual(fs.existsSync(installationDir), true);
++  });
++
++  it('keeps a tree when post-publication global metadata reconciliation fails', async () => {
++    const cache = new Cache(tmpDir);
++    fs.mkdirSync(cache.metadataFile(Browser.CHROME), {recursive: true});
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const firstProvider = new TestProvider(serverUrl);
++    const secondProvider = new TestProvider(serverUrl);
++
++    await assert.rejects(
++      install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [firstProvider, secondProvider],
++        baseUrl: serverUrl.origin,
++      }),
++    );
++    assert.strictEqual(firstProvider.supportsCalls, 1);
++    // Fallback could fail on the same metadata, so rejection alone does not
++    // prove that the post-publication error is terminal.
++    assert.strictEqual(secondProvider.supportsCalls, 0);
++    assert.strictEqual(
++      fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),
++      true,
++    );
++    assert.strictEqual(
++      fs.existsSync(path.join(installationDir, 'browser', 'chrome')),
++      true,
++    );
++  });
++
++  it('does not replace install success with an attempt cleanup error', async () => {
++    const originalRm = internalConstantsForTesting.rm;
++    const messages: string[] = [];
++    internalConstantsForTesting.rm = async () => {
++      throw new Error('cleanup failed');
++    };
++    try {
++      const installedBrowser = await install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [new TestProvider(serverUrl)],
++        baseUrl: serverUrl.origin,
++        logger: () => {
++          return (...args: unknown[]) => {
++            messages.push(args.join(' '));
++          };
++        },
++      });
++
++      assert.strictEqual(fs.existsSync(installedBrowser.executablePath), true);
++      assert.ok(
++        messages.some(message => {
++          return message.includes('cleanup failed');
++        }),
++      );
++    } finally {
++      internalConstantsForTesting.rm = originalRm;
++    }
++  });
++
++  it('publishes a completed DMG tree when detach retries are exhausted', async () => {
++    const originalDmgExecFile = fileUtilConstants.dmgExecFile;
++    const originalDmgReaddir = fileUtilConstants.dmgReaddir;
++    const originalDelay = fileUtilConstants.delay;
++    let detachCalls = 0;
++    const messages: string[] = [];
++    fileUtilConstants.dmgReaddir = async () => {
++      return ['Browser.app'];
++    };
++    fileUtilConstants.delay = async () => {};
++    fileUtilConstants.dmgExecFile = async (file, args) => {
++      if (file === 'cp') {
++        const outputPath = args[2]!;
++        fs.mkdirSync(path.join(outputPath, 'browser'), {recursive: true});
++        fs.writeFileSync(path.join(outputPath, 'browser', 'chrome'), 'browser');
++        return {stdout: '', stderr: ''};
++      }
++      if (args[0] === 'attach') {
++        return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++      }
++      if (args[0] === 'detach') {
++        ++detachCalls;
++        throw new Error('resource busy');
++      }
++      throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++    };
++
++    try {
++      const installedBrowser = await install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.MAC,
++        buildId: '123',
++        providers: [new TestProvider(new URL('/test.dmg', serverUrl))],
++        baseUrl: serverUrl.origin,
++        logger: () => {
++          return (...args: unknown[]) => {
++            messages.push(args.join(' '));
++          };
++        },
++      });
++
++      assert.strictEqual(
++        fs.readFileSync(installedBrowser.executablePath, 'utf8'),
++        'browser',
++      );
++      assert.strictEqual(detachCalls, 3);
++      assert.strictEqual(
++        fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')).length,
++        1,
++      );
++      assert.ok(
++        messages.some(message => {
++          return message.includes('Retaining DMG mount');
++        }),
++      );
++    } finally {
++      fileUtilConstants.dmgExecFile = originalDmgExecFile;
++      fileUtilConstants.dmgReaddir = originalDmgReaddir;
++      fileUtilConstants.delay = originalDelay;
++    }
++  });
++
++  it('does not try another provider after copy and detach both fail', async () => {
++    const originalDmgExecFile = fileUtilConstants.dmgExecFile;
++    const originalDmgReaddir = fileUtilConstants.dmgReaddir;
++    const originalDelay = fileUtilConstants.delay;
++    const firstProvider = new TestProvider(new URL('/test.dmg', serverUrl));
++    const secondProvider = new TestProvider(serverUrl);
++    const copyError = new Error('copy failed');
++    fileUtilConstants.dmgReaddir = async () => {
++      return ['Browser.app'];
++    };
++    fileUtilConstants.delay = async () => {};
++    fileUtilConstants.dmgExecFile = async (file, args) => {
++      if (file === 'cp') {
++        throw copyError;
++      }
++      if (args[0] === 'attach') {
++        return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++      }
++      if (args[0] === 'detach') {
++        throw new Error('resource busy');
++      }
++      throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++    };
++
++    try {
++      await assert.rejects(
++        install({
++          cacheDir: tmpDir,
++          browser: Browser.CHROME,
++          platform: BrowserPlatform.MAC,
++          buildId: '123',
++          providers: [firstProvider, secondProvider],
++          baseUrl: serverUrl.origin,
++        }),
++        (error: unknown) => {
++          assert.ok(error instanceof Error);
++          assert.match(error.message, /copy failed/);
++          assert.strictEqual(
++            (error as Error & {cause?: unknown}).cause,
++            copyError,
++          );
++          return true;
++        },
++      );
++      assert.strictEqual(firstProvider.supportsCalls, 1);
++      assert.strictEqual(secondProvider.supportsCalls, 0);
++      assert.strictEqual(
++        fs.readdirSync(path.join(tmpDir, Browser.CHROME, '.staging')).length,
++        1,
++      );
++    } finally {
++      fileUtilConstants.dmgExecFile = originalDmgExecFile;
++      fileUtilConstants.dmgReaddir = originalDmgReaddir;
++      fileUtilConstants.delay = originalDelay;
++    }
++  });
++
++  it('cleans a failed attempt before provider fallback', async function () {
++    this.timeout(30_000);
++    const invalidUrl = new URL('/invalid.zip', serverUrl);
++    const stagingPath = path.join(tmpDir, Browser.CHROME, '.staging');
++    const fallbackProvider = new TestProvider(serverUrl);
++    let stagingAtFallback: string[] | undefined;
++    const supports = fallbackProvider.supports.bind(fallbackProvider);
++    fallbackProvider.supports = options => {
++      stagingAtFallback = fs.readdirSync(stagingPath);
++      return supports(options);
++    };
++
++    const installedBrowser = await install({
++      cacheDir: tmpDir,
++      browser: Browser.CHROME,
++      platform: BrowserPlatform.LINUX,
++      buildId: '123',
++      providers: [new TestProvider(invalidUrl), fallbackProvider],
++      baseUrl: serverUrl.origin,
++    });
++
++    assert.deepStrictEqual(stagingAtFallback, []);
++    assert.strictEqual(fs.existsSync(installedBrowser.executablePath), true);
++    assert.deepStrictEqual(fs.readdirSync(stagingPath), []);
++  });
++
++  it('rejects an ambiguous marker-less final and preserves it', async () => {
++    const cache = new Cache(tmpDir);
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const firstProvider = new TestProvider(serverUrl, () => {
++      fs.mkdirSync(installationDir, {recursive: true});
++    });
++    const secondProvider = new TestProvider(serverUrl);
++
++    await assert.rejects(
++      install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [firstProvider, secondProvider],
++        baseUrl: serverUrl.origin,
++      }),
++      IncompleteInstallationError,
++    );
++    assert.strictEqual(firstProvider.supportsCalls, 1);
++    // Fallback could report the same error type when inspecting the final,
++    // so rejection alone does not prove that the publication error is terminal.
++    assert.strictEqual(secondProvider.supportsCalls, 0);
++    assert.strictEqual(fs.existsSync(installationDir), true);
++    assert.strictEqual(
++      fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),
++      false,
++    );
++  });
++
++  class TestProvider implements BrowserProvider {
++    executablePathCalls = 0;
++    supportsCalls = 0;
++
++    #url: URL;
++    #beforeExecutablePath?: () => void;
++
++    constructor(url: URL, beforeExecutablePath?: () => void) {
++      this.#url = url;
++      this.#beforeExecutablePath = beforeExecutablePath;
++    }
++
++    supports(_options: DownloadOptions): boolean {
++      this.supportsCalls++;
++      return true;
++    }
++
++    getDownloadUrl(_options: DownloadOptions): URL {
++      return this.#url;
++    }
++
++    getExecutablePath(_options: DownloadOptions): string {
++      this.executablePathCalls++;
++      this.#beforeExecutablePath?.();
++      return path.join('browser', 'chrome');
++    }
++
++    getName(): string {
++      return 'TestProvider';
++    }
++  }
++});
+diff --git a/packages/browsers/test/src/installMarker.test.ts b/packages/browsers/test/src/installMarker.test.ts
+new file mode 100644
+index 00000000000..6404a18b003
+--- /dev/null
++++ b/packages/browsers/test/src/installMarker.test.ts
+@@ -0,0 +1,205 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import assert from 'node:assert';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++import {
++  INSTALL_MARKER_FILE,
++  InvalidInstallMarkerError,
++  readInstallMarker,
++  writeInstallMarker,
++} from '../../lib/installMarker.js';
++
++describe('install marker', () => {
++  let tmpDir: string;
++  let installationDir: string;
++
++  beforeEach(() => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-installation-'));
++    installationDir = path.join(tmpDir, 'installation');
++    fs.mkdirSync(installationDir);
++  });
++
++  afterEach(() => {
++    fs.rmSync(tmpDir, {recursive: true, force: true});
++  });
++
++  it('returns undefined for a legacy installation', () => {
++    assert.strictEqual(readInstallMarker(installationDir), undefined);
++  });
++
++  it('writes and reads a valid marker', () => {
++    const relativeExecutablePath = path.join('browser', 'executable');
++    const executablePath = path.join(installationDir, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, 'browser');
++
++    writeInstallMarker(installationDir, relativeExecutablePath);
++
++    assert.deepStrictEqual(readInstallMarker(installationDir), {
++      version: 1,
++      relativeExecutablePath,
++      executablePath,
++    });
++  });
++
++  it('allows unknown fields in version 1', () => {
++    const relativeExecutablePath = 'executable';
++    fs.writeFileSync(path.join(installationDir, relativeExecutablePath), '');
++    writeMarker({
++      version: 1,
++      relativeExecutablePath,
++      futureField: true,
++    });
++
++    assert.strictEqual(
++      readInstallMarker(installationDir)?.relativeExecutablePath,
++      relativeExecutablePath,
++    );
++  });
++
++  for (const [name, marker] of [
++    ['non-object JSON', []],
++    ['missing executable path', {version: 1}],
++    ['empty executable path', {version: 1, relativeExecutablePath: ''}],
++  ] as const) {
++    it(`rejects ${name}`, () => {
++      writeMarker(marker);
++      assert.throws(() => {
++        readInstallMarker(installationDir);
++      }, InvalidInstallMarkerError);
++    });
++  }
++
++  it('rejects unknown version', () => {
++    fs.writeFileSync(path.join(installationDir, 'executable'), '');
++    writeMarker({version: 2, relativeExecutablePath: 'executable'});
++
++    assertInvalidMarker(/unsupported marker version/);
++  });
++
++  it('rejects absolute executable path', () => {
++    const executablePath = path.join(installationDir, 'executable');
++    fs.writeFileSync(executablePath, '');
++    writeMarker({version: 1, relativeExecutablePath: executablePath});
++
++    assertInvalidMarker(/the executable path is absolute/);
++  });
++
++  it('rejects escaping executable path', () => {
++    fs.writeFileSync(path.join(tmpDir, 'executable'), '');
++    writeMarker({
++      version: 1,
++      relativeExecutablePath: path.join('..', 'executable'),
++    });
++
++    assertInvalidMarker(/the executable path escapes the installation root/);
++  });
++
++  it('rejects malformed JSON', () => {
++    fs.writeFileSync(markerPath(), '{');
++    assert.throws(() => {
++      readInstallMarker(installationDir);
++    }, InvalidInstallMarkerError);
++  });
++
++  it('rejects a non-regular marker', () => {
++    const markerTarget = path.join(tmpDir, 'marker-target');
++    fs.mkdirSync(markerTarget);
++    fs.symlinkSync(markerTarget, markerPath(), 'junction');
++
++    assertInvalidMarker(/the marker is not a regular file/);
++  });
++
++  it('does not replace an archive-provided marker', () => {
++    const relativeExecutablePath = 'executable';
++    fs.writeFileSync(path.join(installationDir, relativeExecutablePath), '');
++    writeMarker({version: 1, relativeExecutablePath});
++
++    assert.throws(
++      () => {
++        writeInstallMarker(installationDir, relativeExecutablePath);
++      },
++      {code: 'EEXIST'},
++    );
++  });
++
++  it('rejects an executable outside the installation through a junction', () => {
++    const externalDir = path.join(tmpDir, 'external');
++    fs.mkdirSync(externalDir);
++    fs.writeFileSync(path.join(externalDir, 'executable'), '');
++    fs.symlinkSync(
++      externalDir,
++      path.join(installationDir, 'external'),
++      'junction',
++    );
++    writeMarker({
++      version: 1,
++      relativeExecutablePath: path.join('external', 'executable'),
++    });
++
++    assert.throws(() => {
++      readInstallMarker(installationDir);
++    }, InvalidInstallMarkerError);
++  });
++
++  it('allows a relocatable relative symlink inside the tree', function () {
++    const realDir = path.join(installationDir, 'real');
++    fs.mkdirSync(realDir);
++    fs.writeFileSync(path.join(realDir, 'executable'), '');
++    try {
++      fs.symlinkSync('real', path.join(installationDir, 'linked'), 'dir');
++    } catch (error) {
++      if (
++        error instanceof Error &&
++        'code' in error &&
++        (error as NodeJS.ErrnoException).code === 'EPERM'
++      ) {
++        this.skip();
++      }
++      throw error;
++    }
++    const relativeExecutablePath = path.join('linked', 'executable');
++    writeInstallMarker(installationDir, relativeExecutablePath);
++
++    assert.strictEqual(
++      readInstallMarker(installationDir)?.executablePath,
++      path.join(installationDir, relativeExecutablePath),
++    );
++
++    const publishedDir = path.join(tmpDir, 'published');
++    fs.renameSync(installationDir, publishedDir);
++    installationDir = publishedDir;
++    assert.strictEqual(
++      readInstallMarker(installationDir)?.executablePath,
++      path.join(installationDir, relativeExecutablePath),
++    );
++  });
++
++  function assertInvalidMarker(message: RegExp): void {
++    assert.throws(
++      () => {
++        readInstallMarker(installationDir);
++      },
++      (error: unknown) => {
++        assert.ok(error instanceof InvalidInstallMarkerError);
++        assert.match(error.message, message);
++        return true;
++      },
++    );
++  }
++
++  function markerPath(): string {
++    return path.join(installationDir, INSTALL_MARKER_FILE);
++  }
++
++  function writeMarker(marker: unknown): void {
++    fs.writeFileSync(markerPath(), JSON.stringify(marker));
++  }
++});
+diff --git a/packages/browsers/test/src/installStaging.test.ts b/packages/browsers/test/src/installStaging.test.ts
+new file mode 100644
+index 00000000000..275d0d8eba3
+--- /dev/null
++++ b/packages/browsers/test/src/installStaging.test.ts
+@@ -0,0 +1,257 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import assert from 'node:assert';
++import fs from 'node:fs';
++import fsPromises from 'node:fs/promises';
++import {syncBuiltinESMExports} from 'node:module';
++import os from 'node:os';
++import path from 'node:path';
++
++import sinon from 'sinon';
++
++import {writeInstallMarker} from '../../lib/installMarker.js';
++import {
++  AmbiguousInstallPublicationError,
++  createInstallAttempt,
++  InstallArchivePublicationError,
++  internalConstantsForTesting,
++  publishInstallArchive,
++  publishInstallTree,
++  removeInstallAttempt,
++} from '../../lib/installStaging.js';
++
++describe('install staging', () => {
++  let tmpDir: string;
++  let browserRoot: string;
++
++  beforeEach(() => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-publication-'));
++    browserRoot = path.join(tmpDir, 'browser');
++  });
++
++  afterEach(() => {
++    fs.rmSync(tmpDir, {recursive: true, force: true});
++  });
++
++  it('creates unique attempts under a regular staging directory', async () => {
++    const first = await createInstallAttempt(browserRoot);
++    const second = await createInstallAttempt(browserRoot);
++
++    assert.notStrictEqual(first.path, second.path);
++    assert.strictEqual(
++      path.dirname(first.path),
++      path.join(browserRoot, '.staging'),
++    );
++    assert.strictEqual(
++      fs.lstatSync(path.join(browserRoot, '.staging')).isDirectory(),
++      true,
++    );
++  });
++
++  it('rejects a staging directory symlink', async () => {
++    fs.mkdirSync(browserRoot, {recursive: true});
++    const externalDir = path.join(tmpDir, 'external');
++    fs.mkdirSync(externalDir);
++    fs.symlinkSync(externalDir, path.join(browserRoot, '.staging'), 'junction');
++
++    await assert.rejects(
++      createInstallAttempt(browserRoot),
++      /Staging path is not a regular directory/,
++    );
++  });
++
++  it('publishes a completed tree', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const executablePath = prepareOutput(attempt.outputPath, 'first');
++    const installationDir = path.join(browserRoot, 'linux-123');
++
++    assert.strictEqual(
++      await publishInstallTree(attempt.outputPath, installationDir),
++      'published',
++    );
++    assert.strictEqual(
++      fs.readFileSync(path.join(installationDir, executablePath), 'utf8'),
++      'first',
++    );
++    assert.strictEqual(fs.existsSync(attempt.outputPath), false);
++  });
++
++  it('preserves a valid winner', async () => {
++    const first = await createInstallAttempt(browserRoot);
++    const second = await createInstallAttempt(browserRoot);
++    const executablePath = prepareOutput(first.outputPath, 'first');
++    prepareOutput(second.outputPath, 'second');
++    const installationDir = path.join(browserRoot, 'linux-123');
++
++    await publishInstallTree(first.outputPath, installationDir);
++    assert.strictEqual(
++      await publishInstallTree(second.outputPath, installationDir),
++      'winner',
++    );
++    assert.strictEqual(
++      fs.readFileSync(path.join(installationDir, executablePath), 'utf8'),
++      'first',
++    );
++    assert.strictEqual(fs.existsSync(second.outputPath), true);
++  });
++
++  it('preserves a valid winner discovered after rename fails', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const executablePath = prepareOutput(attempt.outputPath, 'candidate');
++    const installationDir = path.join(browserRoot, 'linux-123');
++    const rename = sinon.stub(fsPromises, 'rename').callsFake(async () => {
++      // Publish after the initial winner check to exercise the catch recheck.
++      prepareOutput(installationDir, 'winner');
++      throw new Error('rename failed');
++    });
++    syncBuiltinESMExports();
++
++    try {
++      assert.strictEqual(
++        await publishInstallTree(attempt.outputPath, installationDir),
++        'winner',
++      );
++      assert.ok(
++        rename.calledOnceWithExactly(attempt.outputPath, installationDir),
++      );
++      assert.strictEqual(
++        fs.readFileSync(path.join(installationDir, executablePath), 'utf8'),
++        'winner',
++      );
++      assert.strictEqual(
++        fs.readFileSync(path.join(attempt.outputPath, executablePath), 'utf8'),
++        'candidate',
++      );
++    } finally {
++      rename.restore();
++      syncBuiltinESMExports();
++    }
++  });
++
++  it('rejects a marker-less directory that appears during publication', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    prepareOutput(attempt.outputPath, 'candidate');
++    const installationDir = path.join(browserRoot, 'linux-123');
++    fs.mkdirSync(installationDir);
++
++    await assert.rejects(
++      publishInstallTree(attempt.outputPath, installationDir),
++      AmbiguousInstallPublicationError,
++    );
++    assert.strictEqual(fs.existsSync(installationDir), true);
++  });
++
++  it('publishes a completed archive with a hard link', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const archivePath = path.join(browserRoot, 'archive.zip');
++    fs.writeFileSync(attempt.archivePath, 'first');
++
++    await publishInstallArchive(attempt.archivePath, archivePath);
++
++    assert.strictEqual(fs.readFileSync(archivePath, 'utf8'), 'first');
++    assert.strictEqual(fs.existsSync(attempt.archivePath), false);
++  });
++
++  it('uses bounded retries to remove an attempt', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const nestedDir = path.join(attempt.outputPath, 'nested');
++    fs.mkdirSync(nestedDir, {recursive: true});
++    fs.writeFileSync(path.join(nestedDir, 'file'), 'contents');
++    const originalRm = internalConstantsForTesting.rm;
++    let observedTarget: string | undefined;
++    let observedOptions:
++      | {
++          recursive: true;
++          force: true;
++          maxRetries: number;
++          retryDelay: number;
++        }
++      | undefined;
++    internalConstantsForTesting.rm = async (target, options) => {
++      observedTarget = target;
++      observedOptions = options;
++      await originalRm(target, options);
++    };
++
++    try {
++      await removeInstallAttempt(attempt.path);
++      assert.strictEqual(observedTarget, attempt.path);
++      assert.deepStrictEqual(observedOptions, {
++        recursive: true,
++        force: true,
++        maxRetries: 5,
++        retryDelay: 100,
++      });
++      assert.strictEqual(fs.existsSync(attempt.path), false);
++    } finally {
++      internalConstantsForTesting.rm = originalRm;
++    }
++  });
++
++  it('does not replace an archive that appears during publication', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const archivePath = path.join(browserRoot, 'archive.zip');
++    fs.writeFileSync(attempt.archivePath, 'candidate');
++    fs.writeFileSync(archivePath, 'winner');
++
++    await assert.rejects(
++      publishInstallArchive(attempt.archivePath, archivePath),
++      AmbiguousInstallPublicationError,
++    );
++    assert.strictEqual(fs.readFileSync(archivePath, 'utf8'), 'winner');
++    assert.strictEqual(
++      fs.readFileSync(attempt.archivePath, 'utf8'),
++      'candidate',
++    );
++  });
++
++  for (const code of ['ENOTSUP', 'EISDIR']) {
++    it(`reports the hard-link requirement when publication fails with ${code}`, async () => {
++      const attempt = await createInstallAttempt(browserRoot);
++      const archivePath = path.join(browserRoot, 'archive.zip');
++      fs.writeFileSync(attempt.archivePath, 'candidate');
++      const linkError = Object.assign(new Error('operation not supported'), {
++        code,
++      });
++      const originalLink = internalConstantsForTesting.link;
++      internalConstantsForTesting.link = async () => {
++        throw linkError;
++      };
++
++      try {
++        await assert.rejects(
++          publishInstallArchive(attempt.archivePath, archivePath),
++          (error: unknown) => {
++            assert.ok(error instanceof InstallArchivePublicationError);
++            assert.match(error.message, /requires hard-link support/);
++            assert.strictEqual(
++              (error as Error & {cause?: unknown}).cause,
++              linkError,
++            );
++            return true;
++          },
++        );
++        assert.strictEqual(fs.existsSync(archivePath), false);
++        assert.strictEqual(
++          fs.readFileSync(attempt.archivePath, 'utf8'),
++          'candidate',
++        );
++      } finally {
++        internalConstantsForTesting.link = originalLink;
++      }
++    });
++  }
++
++  function prepareOutput(outputPath: string, contents: string): string {
++    const relativeExecutablePath = path.join('browser', 'executable');
++    const executablePath = path.join(outputPath, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, contents);
++    writeInstallMarker(outputPath, relativeExecutablePath);
++    return relativeExecutablePath;
++  }
++});
+diff --git a/packages/browsers/test/src/installWithProviders.test.ts b/packages/browsers/test/src/installWithProviders.test.ts
+index 788ecc47d78..a61746b3f40 100644
+--- a/packages/browsers/test/src/installWithProviders.test.ts
++++ b/packages/browsers/test/src/installWithProviders.test.ts
+@@ -20,6 +20,7 @@ import {
+ 
+ import {getServerUrl, setupTestServer} from './utils.js';
+ import {testChromeBuildId} from './versions.js';
++import {createTestZipBuffer, testZipEntries} from './zip.js';
+ 
+ /**
+  * Simple inline mock provider for testing.
+@@ -70,7 +71,7 @@ class MockProvider implements BrowserProvider {
+ }
+ 
+ describe('Install with providers', () => {
+-  setupTestServer();
++  const serverState = setupTestServer();
+ 
+   let tmpDir: string;
+ 
+@@ -84,53 +85,52 @@ describe('Install with providers', () => {
+     }
+   });
+ 
+-  describe('with test fixtures', () => {
+-    it('should handle custom provider with test archive', async function () {
+-      this.timeout(30000);
+-
+-      // Use the test.tar.bz2 fixture as a mock download
+-      const fixturePath = path.join(
+-        import.meta.dirname,
+-        '..',
+-        'fixtures',
+-        'test.tar.bz2',
+-      );
+-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
++  describe('provider selection', () => {
++    it('should skip unsupported providers and use the default provider', async function () {
++      this.timeout(60000);
+ 
+-      // Copy the fixture to simulate a download
+-      fs.copyFileSync(fixturePath, archivePath);
++      const calledMethods = new Set<string>();
++      const unsupportedProvider: BrowserProvider = {
++        supports() {
++          calledMethods.add('supports');
++          return false;
++        },
++        getDownloadUrl() {
++          calledMethods.add('getDownloadUrl');
++          return null;
++        },
++        getExecutablePath() {
++          calledMethods.add('getExecutablePath');
++          return path.join('unused', 'chrome');
++        },
++        getName() {
++          return 'UnsupportedProvider';
++        },
++      };
+ 
+-      const customProvider = new MockProvider({
+-        supports: true,
+-        getDownloadUrlResult: new URL(`file://${archivePath}`),
+-        getExecutablePath: path.join(tmpDir, 'test-executable'),
++      const result = await install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: testChromeBuildId,
++        providers: [unsupportedProvider],
++        baseUrl: getServerUrl(),
+       });
+ 
+-      // Will likely fail on extraction since test.tar.bz2 is not a real browser archive.
+-      // The important thing is that the custom downloader flow is exercised.
+-      try {
+-        await install({
+-          cacheDir: tmpDir,
+-          browser: Browser.CHROME,
+-          platform: BrowserPlatform.LINUX,
+-          buildId: 'test-build',
+-          providers: [customProvider],
+-          baseUrl: getServerUrl(),
+-        });
+-        // If it succeeds with the fixture, that's unexpected but not wrong
+-      } catch (error) {
+-        // Expected to fail on extraction, but not due to provider interface issues.
+-        assert(error instanceof Error);
+-        assert(!error.message.includes('supports'));
+-        // Allow 'download' related messages since they indicate the provider worked.
+-        assert(error.message.includes('All providers failed'));
+-        // Verify the provider name appears in the error message
+-        assert(error.message.includes('MockProvider'));
+-      }
++      assert.deepStrictEqual(calledMethods, new Set(['supports']));
++      assert.strictEqual(
++        result.executablePath,
++        path.join(
++          tmpDir,
++          'chrome',
++          `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
++          'chrome-linux64',
++          'chrome',
++        ),
++      );
++      assert.ok(fs.statSync(result.executablePath).isFile());
+     });
+-  });
+ 
+-  describe('provider chaining with real downloads', () => {
+     it('should fall back from custom provider to default provider', async function () {
+       this.timeout(60000);
+ 
+@@ -158,29 +158,68 @@ describe('Install with providers', () => {
+     it('should use first successful provider in chain', async function () {
+       this.timeout(60000);
+ 
++      const buildId = '123';
++      const customExecutablePath = path.join('browser', 'chrome');
++      const archive = createTestZipBuffer(testZipEntries);
++      serverState.server.setRoute(
++        '/provider-chain.zip',
++        (_request, response) => {
++          response.writeHead(200, {'content-length': archive.length});
++          response.end(archive);
++        },
++      );
++      const downloadUrl = new URL(`${getServerUrl()}/provider-chain.zip`);
++
+       // First provider fails
+       const failingProvider = new MockProvider({
++        name: 'FailingProvider',
+         supports: true,
+         getDownloadUrlError: new Error('First source failed'),
+       });
+ 
+-      // Second provider also fails (will fall back to default provider)
+-      const secondFailingProvider = new MockProvider({
+-        supports: true,
+-        getDownloadUrlError: new Error('Second source failed'),
++      const successfulProvider = new MockProvider({
++        name: 'SuccessfulProvider',
++        getDownloadUrlResult: downloadUrl,
++        getExecutablePath: customExecutablePath,
++      });
++      const laterProvider = new MockProvider({
++        name: 'LaterProvider',
++        getDownloadUrlResult: downloadUrl,
++        getExecutablePath: customExecutablePath,
+       });
++      const providers = [failingProvider, successfulProvider, laterProvider];
++      const visitedProviders: string[] = [];
++      for (const provider of providers) {
++        const supports = provider.supports.bind(provider);
++        provider.supports = options => {
++          visitedProviders.push(provider.getName());
++          return supports(options);
++        };
++      }
+ 
+-      // Should eventually succeed with default provider
+       const result = await install({
+         cacheDir: tmpDir,
+         browser: Browser.CHROME,
+         platform: BrowserPlatform.LINUX,
+-        buildId: testChromeBuildId,
+-        providers: [failingProvider, secondFailingProvider],
++        buildId,
++        providers,
++        baseUrl: getServerUrl(),
+       });
+ 
+-      assert(result);
+-      assert.strictEqual(typeof result.executablePath, 'string');
++      assert.deepStrictEqual(visitedProviders, [
++        'FailingProvider',
++        'SuccessfulProvider',
++      ]);
++      assert.strictEqual(
++        result.executablePath,
++        path.join(
++          tmpDir,
++          'chrome',
++          `${BrowserPlatform.LINUX}-${buildId}`,
++          customExecutablePath,
++        ),
++      );
++      assert.ok(fs.statSync(result.executablePath).isFile());
+     });
+ 
+     it('should include provider names in error message when all providers fail', async function () {
+@@ -188,10 +227,12 @@ describe('Install with providers', () => {
+ 
+       // All providers fail
+       const provider1 = new MockProvider({
++        name: 'FirstProvider',
+         supports: true,
+         getDownloadUrlError: new Error('Network error'),
+       });
+       const provider2 = new MockProvider({
++        name: 'SecondProvider',
+         supports: true,
+         getDownloadUrlError: new Error('Server error'),
+       });
+@@ -209,66 +250,39 @@ describe('Install with providers', () => {
+       } catch (error) {
+         assert(error instanceof Error);
+         assert(error.message.includes('All providers failed'));
+-        // Verify provider names appear in error message
+-        assert(error.message.includes('MockProvider'));
+-        // Verify both provider errors are included
+-        assert(error.message.includes('Network error'));
+-        assert(error.message.includes('Server error'));
++        // Verify each provider is paired with its error.
++        assert(error.message.includes('FirstProvider: Network error'));
++        assert(error.message.includes('SecondProvider: Server error'));
+       }
+     });
+   });
+ 
+-  describe('getExecutablePath integration', () => {
+-    it('should use custom getExecutablePath when provided', async function () {
+-      this.timeout(60000);
+-
+-      const customExecutablePath = '/custom/executable/path';
+-
+-      // Use a failing custom provider so it falls back to default provider
+-      // but test that getExecutablePath would be used if the provider succeeded
+-      const providerWithCustomPath = new MockProvider({
+-        supports: false, // Will fall back to default provider
+-        getExecutablePath: customExecutablePath,
+-      });
+-
+-      const result = await install({
+-        cacheDir: tmpDir,
+-        browser: Browser.CHROME,
+-        platform: BrowserPlatform.LINUX,
+-        buildId: testChromeBuildId,
+-        providers: [providerWithCustomPath],
+-        baseUrl: getServerUrl(),
+-      });
+-
+-      // Since default provider is used, we get the real executable path
+-      // But the test verifies that the provider interface accepts getExecutablePath
+-      assert(result);
+-      assert.strictEqual(typeof result.executablePath, 'string');
+-      assert(result.executablePath !== customExecutablePath); // Should be default provider path
+-    });
+-  });
+-
+   describe('persistence', () => {
+     it('should persist executable path in metadata for custom providers', async function () {
+       this.timeout(60000);
+ 
+-      // Use the test.tar.bz2 fixture as a mock download
+-      const fixturePath = path.join(
+-        import.meta.dirname,
+-        '..',
+-        'fixtures',
+-        'test.tar.bz2',
++      const buildId = '123';
++      const customExecutablePath = path.join('browser', 'chrome');
++      const expectedExecutablePath = path.join(
++        tmpDir,
++        'chrome',
++        `${BrowserPlatform.LINUX}-${buildId}`,
++        customExecutablePath,
++      );
++      const archive = createTestZipBuffer(testZipEntries);
++      serverState.server.setRoute(
++        '/custom-provider.zip',
++        (_request, response) => {
++          response.writeHead(200, {'content-length': archive.length});
++          response.end(archive);
++        },
+       );
+-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
+-
+-      // Copy the fixture to simulate a download
+-      fs.copyFileSync(fixturePath, archivePath);
+ 
+-      // Create a custom provider that uses the test fixture
++      // The fixture uses a genuinely different layout from the default provider.
+       const customProvider = new MockProvider({
+         supports: true,
+-        getDownloadUrlResult: new URL('file://' + archivePath),
+-        getExecutablePath: 'chrome-linux/chrome',
++        getDownloadUrlResult: new URL(`${getServerUrl()}/custom-provider.zip`),
++        getExecutablePath: customExecutablePath,
+       });
+ 
+       // Install using custom provider
+@@ -276,11 +290,17 @@ describe('Install with providers', () => {
+         cacheDir: tmpDir,
+         browser: Browser.CHROME,
+         platform: BrowserPlatform.LINUX,
+-        buildId: testChromeBuildId,
++        buildId,
+         providers: [customProvider],
+         baseUrl: getServerUrl(),
+       });
+ 
++      assert.strictEqual(result.executablePath, expectedExecutablePath);
++      assert.strictEqual(
++        fs.readFileSync(expectedExecutablePath, 'utf8'),
++        '#!/bin/sh\necho chrome\n',
++      );
++
+       // Verify .metadata exists at browser root and contains the executable path
+       const metadataPath = path.join(tmpDir, 'chrome', '.metadata');
+       assert.ok(
+@@ -289,78 +309,51 @@ describe('Install with providers', () => {
+       );
+ 
+       const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+-      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
+-      assert.ok(
++      const key = `${BrowserPlatform.LINUX}-${buildId}`;
++      assert.strictEqual(
+         metadata.executablePaths?.[key],
+-        'Metadata should contain the executable path',
++        customExecutablePath,
++        'Metadata should contain the exact custom executable path',
+       );
+ 
+-      // Verify getInstalledBrowsers uses the persisted path
++      // Verify getInstalledBrowsers returns the expected custom executable path.
+       const installed = await getInstalledBrowsers({cacheDir: tmpDir});
+       const found = installed.find(b => {
+-        return b.buildId === testChromeBuildId;
++        return b.buildId === buildId;
+       });
+       assert.ok(found, 'Should find the installed browser');
+       assert.strictEqual(
+         found?.executablePath,
+-        result.executablePath,
++        expectedExecutablePath,
+         'getInstalledBrowsers should return the correct executable path',
+       );
+     });
+ 
+-    it('should not write metadata for default provider installations', async function () {
++    it('should remove a stale custom path after a default provider installation', async function () {
+       this.timeout(60000);
+ 
+-      // Use the test.tar.bz2 fixture as a mock download
+-      const fixturePath = path.join(
+-        import.meta.dirname,
+-        '..',
+-        'fixtures',
+-        'test.tar.bz2',
+-      );
+-      const archivePath = path.join(tmpDir, 'test-archive.tar.bz2');
+-
+-      // Copy the fixture to simulate a download
+-      fs.copyFileSync(fixturePath, archivePath);
+-
+-      // Create a custom provider that uses the test fixture
+-      const customProvider = new MockProvider({
+-        supports: true,
+-        getDownloadUrlResult: new URL('file://' + archivePath),
+-        getExecutablePath: 'chrome-linux/chrome',
+-      });
+-
+-      // Install using custom provider first
+-      await install({
+-        cacheDir: tmpDir,
+-        browser: Browser.CHROME,
+-        platform: BrowserPlatform.LINUX,
+-        buildId: testChromeBuildId,
+-        providers: [customProvider],
+-        baseUrl: getServerUrl(),
+-      });
+-
+-      // Verify .metadata was created by custom provider
++      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
+       const metadataPath = path.join(tmpDir, 'chrome', '.metadata');
+-      assert.ok(
+-        fs.existsSync(metadataPath),
+-        '.metadata should exist after custom provider install',
+-      );
+-
+-      // Now install using default provider (no providers option)
+-      // First, clean up the installation but keep the metadata
+-      const installDir = path.join(
++      const expectedExecutablePath = path.join(
+         tmpDir,
+         'chrome',
+-        `${BrowserPlatform.LINUX}-${testChromeBuildId}`,
++        key,
++        'chrome-linux64',
++        'chrome',
+       );
+-      fs.rmSync(installDir, {recursive: true, force: true});
+ 
+-      // Re-copy the fixture for the default provider install
+-      fs.copyFileSync(fixturePath, archivePath);
++      // Seed the registration left behind after a custom install was removed.
++      fs.mkdirSync(path.dirname(metadataPath), {recursive: true});
++      fs.writeFileSync(
++        metadataPath,
++        JSON.stringify({
++          aliases: {},
++          executablePaths: {[key]: path.join('browser', 'chrome')},
++        }),
++      );
+ 
+       // Install using default provider
+-      await install({
++      const result = await install({
+         cacheDir: tmpDir,
+         browser: Browser.CHROME,
+         platform: BrowserPlatform.LINUX,
+@@ -369,16 +362,15 @@ describe('Install with providers', () => {
+         // No providers option = uses default provider
+       });
+ 
+-      // Read the metadata - it should still only have the original entry
+-      // The default provider should not have added/modified executablePaths
+-      const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+-      const key = `${BrowserPlatform.LINUX}-${testChromeBuildId}`;
++      assert.strictEqual(result.executablePath, expectedExecutablePath);
++      assert.ok(fs.statSync(expectedExecutablePath).isFile());
+ 
+-      // The metadata file exists but default provider doesn't write executablePaths
+-      // The original entry from custom provider should still be there
+-      assert.ok(
++      // The completed default-layout install reconciles the stale custom path.
++      const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
++      assert.strictEqual(
+         metadata.executablePaths?.[key],
+-        'Executable path should still be in metadata from custom provider',
++        undefined,
++        'The stale custom executable path should be removed',
+       );
+     });
+ 
+@@ -434,12 +426,21 @@ describe('Install with providers', () => {
+     });
+   });
+ 
+-  describe('platform-specific behavior', () => {
+-    it('should work across different platforms', async function () {
++  describe('platform options and cache identity', () => {
++    it('should forward platform options and keep installations separate', async function () {
+       this.timeout(60000);
+ 
+-      // Test with different platforms - this tests that the downloader interface
+-      // works consistently across platforms
++      const buildId = '123';
++      const customExecutablePath = path.join('browser', 'chrome');
++      // This fixture models extraction and registration, not binary compatibility.
++      const archive = createTestZipBuffer(testZipEntries);
++      serverState.server.setRoute(
++        '/platform-provider.zip',
++        (_request, response) => {
++          response.writeHead(200, {'content-length': archive.length});
++          response.end(archive);
++        },
++      );
+       const platforms = [
+         BrowserPlatform.LINUX,
+         BrowserPlatform.MAC,
+@@ -447,17 +448,71 @@ describe('Install with providers', () => {
+       ];
+ 
+       for (const platform of platforms) {
++        const calledMethods = new Set<string>();
++        const checkOptions = (
++          method: string,
++          options: DownloadOptions,
++        ): void => {
++          calledMethods.add(method);
++          assert.strictEqual(options.browser, Browser.CHROME);
++          assert.strictEqual(options.platform, platform);
++          assert.strictEqual(options.buildId, buildId);
++        };
++        const provider: BrowserProvider = {
++          supports(options) {
++            checkOptions('supports', options);
++            return true;
++          },
++          getDownloadUrl(options) {
++            checkOptions('getDownloadUrl', options);
++            return new URL(`${getServerUrl()}/platform-provider.zip`);
++          },
++          getExecutablePath(options) {
++            checkOptions('getExecutablePath', options);
++            return customExecutablePath;
++          },
++          getName() {
++            return 'PlatformTestProvider';
++          },
++        };
+         const result = await install({
+           cacheDir: tmpDir,
+           browser: Browser.CHROME,
+           platform,
+-          buildId: testChromeBuildId,
+-          providers: [], // Use default provider
++          buildId,
++          providers: [provider],
+           baseUrl: getServerUrl(),
+         });
+ 
+-        assert(result);
+-        assert.strictEqual(typeof result.path, 'string');
++        assert.deepStrictEqual(
++          calledMethods,
++          new Set(['supports', 'getDownloadUrl', 'getExecutablePath']),
++        );
++        const expectedInstallDir = path.join(
++          tmpDir,
++          'chrome',
++          `${platform}-${buildId}`,
++        );
++        assert.strictEqual(result.platform, platform);
++        assert.strictEqual(result.path, expectedInstallDir);
++        assert.strictEqual(
++          result.executablePath,
++          path.join(expectedInstallDir, customExecutablePath),
++        );
++      }
++
++      const installed = await getInstalledBrowsers({cacheDir: tmpDir});
++      assert.deepStrictEqual(
++        installed
++          .map(b => {
++            return b.platform;
++          })
++          .sort(),
++        [...platforms].sort(),
++      );
++      for (const browser of installed) {
++        assert.strictEqual(browser.buildId, buildId);
++        assert.ok(fs.statSync(browser.executablePath).isFile());
+       }
+     });
+   });
+diff --git a/packages/browsers/test/src/zip.ts b/packages/browsers/test/src/zip.ts
+new file mode 100644
+index 00000000000..e6743ef18b2
+--- /dev/null
++++ b/packages/browsers/test/src/zip.ts
+@@ -0,0 +1,111 @@
++/**
++ * @license
++ * Copyright 2026 Google Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++import fs from 'node:fs';
++import zlib from 'node:zlib';
++
++export interface TestZipEntry {
++  name: string;
++  type?: 'file' | 'dir' | 'symlink';
++  content?: string;
++  mode?: number;
++}
++
++/**
++ * Creates an uncompressed (STORE) PKZIP archive with Unix external file
++ * attributes for testing zip extraction on the fly.
++ */
++export function createTestZipBuffer(entries: TestZipEntry[]): Buffer {
++  const localParts: Buffer[] = [];
++  const centralParts: Buffer[] = [];
++  let localOffset = 0;
++
++  for (const entry of entries) {
++    const nameBuf = Buffer.from(entry.name, 'utf8');
++    const dataBuf = Buffer.from(entry.content ?? '', 'utf8');
++    const crc = zlib.crc32(dataBuf);
++    const kind = entry.type ?? (entry.name.endsWith('/') ? 'dir' : 'file');
++    const fileTypeBits =
++      kind === 'symlink'
++        ? fs.constants.S_IFLNK
++        : kind === 'dir'
++          ? fs.constants.S_IFDIR
++          : fs.constants.S_IFREG;
++    const permBits =
++      entry.mode ??
++      (kind === 'symlink' ? 0o777 : kind === 'dir' ? 0o755 : 0o644);
++    const unixMode = fileTypeBits | permBits;
++
++    const localHeader = Buffer.alloc(30);
++    localHeader.writeUInt32LE(0x04034b50, 0);
++    localHeader.writeUInt16LE(20, 4);
++    localHeader.writeUInt16LE(0x0800, 6);
++    localHeader.writeUInt16LE(0, 8);
++    localHeader.writeUInt16LE(0, 10);
++    localHeader.writeUInt16LE(0x0021, 12);
++    localHeader.writeUInt32LE(crc, 14);
++    localHeader.writeUInt32LE(dataBuf.length, 18);
++    localHeader.writeUInt32LE(dataBuf.length, 22);
++    localHeader.writeUInt16LE(nameBuf.length, 26);
++    localHeader.writeUInt16LE(0, 28);
++    localParts.push(localHeader, nameBuf, dataBuf);
++
++    const centralHeader = Buffer.alloc(46);
++    centralHeader.writeUInt32LE(0x02014b50, 0);
++    centralHeader.writeUInt16LE((3 << 8) | 20, 4);
++    centralHeader.writeUInt16LE(20, 6);
++    centralHeader.writeUInt16LE(0x0800, 8);
++    centralHeader.writeUInt16LE(0, 10);
++    centralHeader.writeUInt16LE(0, 12);
++    centralHeader.writeUInt16LE(0x0021, 14);
++    centralHeader.writeUInt32LE(crc, 16);
++    centralHeader.writeUInt32LE(dataBuf.length, 20);
++    centralHeader.writeUInt32LE(dataBuf.length, 24);
++    centralHeader.writeUInt16LE(nameBuf.length, 28);
++    centralHeader.writeUInt16LE(0, 30);
++    centralHeader.writeUInt16LE(0, 32);
++    centralHeader.writeUInt16LE(0, 34);
++    centralHeader.writeUInt16LE(0, 36);
++    centralHeader.writeUInt32LE((unixMode << 16) >>> 0, 38);
++    centralHeader.writeUInt32LE(localOffset, 42);
++    centralParts.push(centralHeader, nameBuf);
++
++    localOffset += localHeader.length + nameBuf.length + dataBuf.length;
++  }
++
++  const centralDir = Buffer.concat(centralParts);
++  const eocd = Buffer.alloc(22);
++  eocd.writeUInt32LE(0x06054b50, 0);
++  eocd.writeUInt16LE(0, 4);
++  eocd.writeUInt16LE(0, 6);
++  eocd.writeUInt16LE(entries.length, 8);
++  eocd.writeUInt16LE(entries.length, 10);
++  eocd.writeUInt32LE(centralDir.length, 12);
++  eocd.writeUInt32LE(localOffset, 16);
++  eocd.writeUInt16LE(0, 20);
++
++  return Buffer.concat([...localParts, centralDir, eocd]);
++}
++
++export function createTestZip(
++  zipPath: string,
++  entries: TestZipEntry[],
++): string {
++  fs.writeFileSync(zipPath, createTestZipBuffer(entries));
++  return zipPath;
++}
++
++export const testZipEntries: TestZipEntry[] = [
++  {name: 'browser/', type: 'dir'},
++  {name: 'browser/locales/', type: 'dir'},
++  {name: 'browser/locales/en-US.pak', content: 'resource', mode: 0o644},
++  {
++    name: 'browser/chrome',
++    content: '#!/bin/sh\necho chrome\n',
++    mode: 0o755,
++  },
++  {name: 'browser/product_logo.png', content: 'logo', mode: 0o644},
++];

@@ -1,0 +1,370 @@
+name: Upstream-integrated browser staging on Linux
+
+# CI transport only: apply the uncommitted Mac candidate in an isolated source
+# worktree and require its exact Git tree before and after every job.
+on:
+  push:
+    branches:
+      - experiment/browser-install-staging-upstream-linux-2026-10-21
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: staging-upstream-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  FORCE_COLOR: 0
+  PUPPETEER_SKIP_DOWNLOAD: true
+  SOURCE_BASE: bd227cea68835f8e6bbc983b9ca4564cebfa8938
+  SOURCE_TREE: 99fa1aa8ab5b8ddb76ebc3440598854c49245feb
+  HARNESS: .github/experiments/staging-upstream-linux-2026-10-21
+
+jobs:
+  package-tests:
+    name: Package tests and native extractors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the CI transport
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.15.0
+
+      - name: Verify transport and prepare the exact uncommitted candidate
+        id: candidate
+        run: |
+          artifact_dir="$RUNNER_TEMP/staging-upstream-package"
+          mkdir -p "$artifact_dir"
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          test "$(node --version)" = v24.15.0
+          test "$(npm --version)" = 11.12.1
+          node "$HARNESS/verify.mjs" transport "$GITHUB_WORKSPACE"
+          git worktree add --detach "$RUNNER_TEMP/staging-upstream-source" "$SOURCE_BASE"
+          git -C "$RUNNER_TEMP/staging-upstream-source" apply --index "$GITHUB_WORKSPACE/$HARNESS/candidate.patch"
+          test "$(git -C "$RUNNER_TEMP/staging-upstream-source" write-tree)" = "$SOURCE_TREE"
+          cp -R "$HARNESS" "$artifact_dir/as-run"
+          cp .github/workflows/browser-install-staging-upstream-linux.yml "$artifact_dir/workflow.yml"
+          printf 'SOURCE_DIR=%s\n' "$RUNNER_TEMP/staging-upstream-source" >> "$GITHUB_ENV"
+          printf 'EVIDENCE_DIR=%s\n' "$artifact_dir" >> "$GITHUB_ENV"
+
+      - name: Record runner environment
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-package"
+          mkdir -p "$artifact_dir"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            printf 'architecture=%s\n' "$(dpkg --print-architecture)"
+            printf 'node=%s\n' "$(node --version)"
+            printf 'npm=%s\n' "$(npm --version)"
+            printf 'commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'tree=%s\n' "$(git write-tree)"
+            id
+            findmnt -T "$SOURCE_DIR"
+            df -h "$SOURCE_DIR"
+            xz --version | sed -n '1p'
+            bzip2 --version 2>&1 | sed -n '1p'
+            tar --version | sed -n '1p'
+          } | tee "$artifact_dir/environment.log"
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" -ne 0
+          test "$(findmnt -n -o FSTYPE -T "$SOURCE_DIR")" = ext4
+          test "$(git rev-parse HEAD)" = "$SOURCE_BASE"
+          test "$(git write-tree)" = "$SOURCE_TREE"
+
+      - name: Disable AppArmor user namespace restriction
+        run: |
+          cd "$SOURCE_DIR"
+          {
+            cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            unshare --user --map-root-user id
+          } 2>&1 | tee "$EVIDENCE_DIR/userns.log"
+
+      - name: Install dependencies
+        run: |
+          cd "$SOURCE_DIR"
+          npm ci 2>&1 | tee "$EVIDENCE_DIR/npm-ci.log"
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
+
+      - name: Build the repository and browser tests
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-package"
+          npm run build 2>&1 | tee "$artifact_dir/build.log"
+          npm run build:test --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build-test.log"
+
+      - name: Verify source and independently compiled bytes
+        run: |
+          node "$EVIDENCE_DIR/as-run/verify.mjs" verify "$SOURCE_DIR" "$EVIDENCE_DIR" \
+            2>&1 | tee "$EVIDENCE_DIR/inputs-before.log"
+
+      - name: Run browser package tests
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-package"
+          npm test --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/package-test.log"
+
+      - name: Confirm Linux staging evidence was exercised
+        run: |
+          cd "$SOURCE_DIR"
+          log="$RUNNER_TEMP/staging-upstream-package/package-test.log"
+          grep -F 'unpacks tar.xz' "$log"
+          grep -F 'unpacks tar.bz2' "$log"
+          grep -F 'should download a buildId that is a bzip2 archive' "$log"
+          grep -F 'converges concurrent installs on a completed tree' "$log"
+
+      - name: Verify unchanged candidate after package tests
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        run: |
+          node "$EVIDENCE_DIR/as-run/verify.mjs" final "$SOURCE_DIR" "$EVIDENCE_DIR" package \
+            2>&1 | tee "$EVIDENCE_DIR/inputs-after.log"
+
+      - name: Upload package validation evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-upstream-linux-package
+          path: ${{ runner.temp }}/staging-upstream-package
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  concurrency-and-install-deps:
+    name: Concurrent publication and installDeps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the CI transport
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.15.0
+
+      - name: Verify transport and prepare the exact uncommitted candidate
+        id: candidate
+        run: |
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          mkdir -p "$artifact_dir"
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          test "$(node --version)" = v24.15.0
+          test "$(npm --version)" = 11.12.1
+          node "$HARNESS/verify.mjs" transport "$GITHUB_WORKSPACE"
+          git worktree add --detach "$RUNNER_TEMP/staging-upstream-source" "$SOURCE_BASE"
+          git -C "$RUNNER_TEMP/staging-upstream-source" apply --index "$GITHUB_WORKSPACE/$HARNESS/candidate.patch"
+          test "$(git -C "$RUNNER_TEMP/staging-upstream-source" write-tree)" = "$SOURCE_TREE"
+          cp -R "$HARNESS" "$artifact_dir/as-run"
+          cp .github/workflows/browser-install-staging-upstream-linux.yml "$artifact_dir/workflow.yml"
+          printf 'SOURCE_DIR=%s\n' "$RUNNER_TEMP/staging-upstream-source" >> "$GITHUB_ENV"
+          printf 'EVIDENCE_DIR=%s\n' "$artifact_dir" >> "$GITHUB_ENV"
+
+      - name: Record runner environment
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          mkdir -p "$artifact_dir"
+          {
+            date --iso-8601=seconds
+            uname -a
+            cat /etc/os-release
+            printf 'architecture=%s\n' "$(dpkg --print-architecture)"
+            printf 'node=%s\n' "$(node --version)"
+            printf 'npm=%s\n' "$(npm --version)"
+            printf 'commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'tree=%s\n' "$(git write-tree)"
+            printf 'runner_uid=%s\n' "$(id -u)"
+            findmnt -T "$SOURCE_DIR"
+            df -h "$SOURCE_DIR"
+          } | tee "$artifact_dir/environment.log"
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" -ne 0
+          test "$(findmnt -n -o FSTYPE -T "$SOURCE_DIR")" = ext4
+          test "$(git rev-parse HEAD)" = "$SOURCE_BASE"
+          test "$(git write-tree)" = "$SOURCE_TREE"
+
+      - name: Disable AppArmor user namespace restriction
+        run: |
+          cd "$SOURCE_DIR"
+          {
+            cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            unshare --user --map-root-user id
+          } 2>&1 | tee "$EVIDENCE_DIR/userns.log"
+
+      - name: Install dependencies
+        run: |
+          cd "$SOURCE_DIR"
+          npm ci 2>&1 | tee "$EVIDENCE_DIR/npm-ci.log"
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
+
+      - name: Build browser package
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          npm run build --workspace @puppeteer/browsers 2>&1 | tee "$artifact_dir/build.log"
+
+      - name: Verify source and independently compiled bytes
+        run: |
+          node "$EVIDENCE_DIR/as-run/verify.mjs" verify "$SOURCE_DIR" "$EVIDENCE_DIR" \
+            2>&1 | tee "$EVIDENCE_DIR/inputs-before.log"
+
+      - name: Race two real Chrome installations
+        id: concurrent-install
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          cache_dir="$RUNNER_TEMP/browser-install-staging-cache"
+          cli=packages/browsers/lib/main-cli.js
+          mkdir -p "$cache_dir"
+
+          set +e
+          NODE_DEBUG='puppeteer:browsers:*' node "$cli" install chrome@155.0.8059.84 --path "$cache_dir" \
+            --format='RESULT|{{buildId}}|{{path}}' >"$artifact_dir/install-a.log" 2>&1 &
+          pid_a=$!
+          NODE_DEBUG='puppeteer:browsers:*' node "$cli" install chrome@155.0.8059.84 --path "$cache_dir" \
+            --format='RESULT|{{buildId}}|{{path}}' >"$artifact_dir/install-b.log" 2>&1 &
+          pid_b=$!
+          wait "$pid_a"
+          status_a=$?
+          wait "$pid_b"
+          status_b=$?
+          set -e
+
+          cat "$artifact_dir/install-a.log"
+          cat "$artifact_dir/install-b.log"
+          test "$status_a" -eq 0
+          test "$status_b" -eq 0
+
+          record_a="$(grep '^RESULT|' "$artifact_dir/install-a.log" | tail -n 1)"
+          record_b="$(grep '^RESULT|' "$artifact_dir/install-b.log" | tail -n 1)"
+          test -n "$record_a"
+          test "$record_a" = "$record_b"
+          IFS='|' read -r prefix build_id executable_path <<<"$record_a"
+          test "$prefix" = RESULT
+          test -n "$build_id"
+          test -x "$executable_path"
+
+          install_dir="$(dirname "$(dirname "$executable_path")")"
+          marker_path="$install_dir/.puppeteer-install"
+          deps_path="$(dirname "$executable_path")/deb.deps"
+          test -f "$marker_path"
+          test -f "$deps_path"
+          if find "$cache_dir/chrome/.staging" -mindepth 1 -print -quit | grep -q .; then
+            echo 'Concurrent install left a private attempt behind' >&2
+            exit 1
+          fi
+
+          printf 'cache_dir=%s\n' "$cache_dir" >> "$GITHUB_OUTPUT"
+          printf 'build_id=%s\n' "$build_id" >> "$GITHUB_OUTPUT"
+          printf 'executable_path=%s\n' "$executable_path" >> "$GITHUB_OUTPUT"
+          printf 'install_dir=%s\n' "$install_dir" >> "$GITHUB_OUTPUT"
+          printf 'marker_path=%s\n' "$marker_path" >> "$GITHUB_OUTPUT"
+          sha256sum "$marker_path" "$executable_path" | tee "$artifact_dir/marker-before-install-deps.sha256"
+
+      - name: Confirm non-root installDeps failure preserves the tree
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          cli=packages/browsers/lib/main-cli.js
+          cache_dir='${{ steps.concurrent-install.outputs.cache_dir }}'
+          build_id='${{ steps.concurrent-install.outputs.build_id }}'
+          executable_path='${{ steps.concurrent-install.outputs.executable_path }}'
+          marker_path='${{ steps.concurrent-install.outputs.marker_path }}'
+
+          set +e
+          NODE_DEBUG='puppeteer:browsers:*' node "$cli" install "chrome@$build_id" \
+            --path "$cache_dir" --install-deps \
+            >"$artifact_dir/install-deps-non-root.log" 2>&1
+          status=$?
+          set -e
+          cat "$artifact_dir/install-deps-non-root.log"
+          test "$status" -ne 0
+          grep -F 'Installing system dependencies requires root privileges' \
+            "$artifact_dir/install-deps-non-root.log"
+          test -x "$executable_path"
+          test -f "$marker_path"
+          sha256sum --check "$artifact_dir/marker-before-install-deps.sha256"
+
+      - name: Install system dependencies as root
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          cli=packages/browsers/lib/main-cli.js
+          cache_dir='${{ steps.concurrent-install.outputs.cache_dir }}'
+          build_id='${{ steps.concurrent-install.outputs.build_id }}'
+          node_path="$(command -v node)"
+
+          sudo apt-get update 2>&1 | tee "$artifact_dir/apt-get-update.log"
+          sudo env "PATH=$PATH" NODE_DEBUG='puppeteer:browsers:*' \
+            "$node_path" "$cli" install "chrome@$build_id" \
+            --path "$cache_dir" --install-deps \
+            >"$artifact_dir/install-deps-root.log" 2>&1
+          cat "$artifact_dir/install-deps-root.log"
+          sudo chown -R "$(id -u):$(id -g)" "$cache_dir"
+
+      - name: Launch the published browser as the runner user
+        run: |
+          cd "$SOURCE_DIR"
+          artifact_dir="$RUNNER_TEMP/staging-upstream-install-deps"
+          cli=packages/browsers/lib/main-cli.js
+          cache_dir='${{ steps.concurrent-install.outputs.cache_dir }}'
+          build_id='${{ steps.concurrent-install.outputs.build_id }}'
+          executable_path='${{ steps.concurrent-install.outputs.executable_path }}'
+          marker_path='${{ steps.concurrent-install.outputs.marker_path }}'
+
+          ldd "$executable_path" 2>&1 | tee "$artifact_dir/ldd.log"
+          if grep -F 'not found' "$artifact_dir/ldd.log"; then
+            echo 'Chrome still has unresolved shared-library dependencies' >&2
+            exit 1
+          fi
+          xvfb-run --auto-servernum node "$cli" launch "chrome@$build_id" \
+            --path "$cache_dir" --dumpio -- --version \
+            2>&1 | tee "$artifact_dir/launch.log"
+          grep -F "$build_id" "$artifact_dir/launch.log"
+          test -x "$executable_path"
+          test -f "$marker_path"
+          sha256sum --check "$artifact_dir/marker-before-install-deps.sha256"
+          if find "$cache_dir/chrome/.staging" -mindepth 1 -print -quit | grep -q .; then
+            echo 'Post-install processing left a private attempt behind' >&2
+            exit 1
+          fi
+
+      - name: Verify unchanged candidate after native tests
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        run: |
+          node "$EVIDENCE_DIR/as-run/verify.mjs" final "$SOURCE_DIR" "$EVIDENCE_DIR" native \
+            2>&1 | tee "$EVIDENCE_DIR/inputs-after.log"
+
+      - name: Upload concurrency and installDeps evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-upstream-linux-install-deps
+          path: ${{ runner.temp }}/staging-upstream-install-deps
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
