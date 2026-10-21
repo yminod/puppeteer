@@ -1,6 +1,6 @@
 name: Upstream-integrated browser staging on Linux
 
-# CI transport only: apply the uncommitted Mac candidate in an isolated source
+# CI transport only: apply the Windows-validated candidate in an isolated source
 # worktree and require its exact Git tree before and after every job.
 on:
   push:
@@ -23,7 +23,7 @@ env:
   FORCE_COLOR: 0
   PUPPETEER_SKIP_DOWNLOAD: true
   SOURCE_BASE: bd227cea68835f8e6bbc983b9ca4564cebfa8938
-  SOURCE_TREE: 99fa1aa8ab5b8ddb76ebc3440598854c49245feb
+  SOURCE_TREE: 457a7f39230e8e360c94b938967fe818fc97de30
   HARNESS: .github/experiments/staging-upstream-linux-2026-10-21
 
 jobs:

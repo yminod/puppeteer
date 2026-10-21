@@ -979,7 +979,7 @@ index 661fe6a8457..25d69072374 100644
    });
  }
 diff --git a/packages/browsers/src/install.ts b/packages/browsers/src/install.ts
-index 769987a4492..f0b7253ec3e 100644
+index 769987a4492..f058347b41c 100644
 --- a/packages/browsers/src/install.ts
 +++ b/packages/browsers/src/install.ts
 @@ -7,7 +7,7 @@
@@ -991,7 +991,7 @@ index 769987a4492..f0b7253ec3e 100644
  import os from 'node:os';
  import path from 'node:path';
  
-@@ -15,13 +15,27 @@ import {
+@@ -15,13 +15,28 @@ import {
    Browser,
    BrowserPlatform,
    downloadUrls,
@@ -1007,6 +1007,7 @@ index 769987a4492..f0b7253ec3e 100644
 +import {
 +  InvalidInstallMarkerError,
 +  readInstallMarker,
++  validateExecutablePath,
 +  writeInstallMarker,
 +} from './installMarker.js';
 +import {
@@ -1020,7 +1021,7 @@ index 769987a4492..f0b7253ec3e 100644
  import {ProgressBar} from './ProgressBar.js';
  import type {BrowserProvider} from './provider.js';
  
-@@ -91,6 +105,9 @@ export interface InstallOptions {
+@@ -91,6 +106,9 @@ export interface InstallOptions {
    /**
     * Whether to unpack and install browser archives.
     *
@@ -1030,7 +1031,7 @@ index 769987a4492..f0b7253ec3e 100644
     * @defaultValue `true`
     */
    unpack?: boolean;
-@@ -157,13 +174,15 @@ export interface InstallOptions {
+@@ -157,13 +175,15 @@ export interface InstallOptions {
    logger?: Logger;
  }
  
@@ -1047,7 +1048,7 @@ index 769987a4492..f0b7253ec3e 100644
  
  /**
   * Install using custom provider plugins.
-@@ -261,6 +280,9 @@ async function installWithProviders(
+@@ -261,6 +281,9 @@ async function installWithProviders(
        // Download and install using the URL from the provider
        return await installUrl(url, options, provider, logger);
      } catch (err) {
@@ -1057,7 +1058,7 @@ index 769987a4492..f0b7253ec3e 100644
        logger?.(DEBUG_PREFIXES.install)?.(
          `Provider ${provider.getName()} failed: ${(err as Error).message}`,
        );
-@@ -279,14 +301,6 @@ async function installWithProviders(
+@@ -279,14 +302,6 @@ async function installWithProviders(
      })
      .join('\n');
    const message = `All providers failed for ${options.browser} ${options.buildId}:\n${errorDetails}`;
@@ -1072,7 +1073,7 @@ index 769987a4492..f0b7253ec3e 100644
    throw new Error(message);
  }
  
-@@ -429,19 +443,67 @@ async function installUrl(
+@@ -429,19 +444,67 @@ async function installUrl(
      if (existsSync(archivePath)) {
        return archivePath;
      }
@@ -1151,7 +1152,7 @@ index 769987a4492..f0b7253ec3e 100644
    const relativeExecutablePath = await provider.getExecutablePath({
      browser: options.browser,
      buildId: options.buildId,
-@@ -451,51 +513,31 @@ async function installUrl(
+@@ -451,51 +514,31 @@ async function installUrl(
      `Using executable path from provider: ${relativeExecutablePath}`,
    );
  
@@ -1216,7 +1217,7 @@ index 769987a4492..f0b7253ec3e 100644
          debugTimeEnd('download', logger);
        }
      } else {
-@@ -505,35 +547,82 @@ async function installUrl(
+@@ -505,35 +548,86 @@ async function installUrl(
      }
  
      logger?.(DEBUG_PREFIXES.install)?.(
@@ -1255,7 +1256,11 @@ index 769987a4492..f0b7253ec3e 100644
 +    const stagedBrowser = {
 +      browser: options.browser,
 +      platform: options.platform,
-+      executablePath: path.join(attempt.outputPath, relativeExecutablePath),
++      path: attempt.outputPath,
++      executablePath: validateExecutablePath(
++        attempt.outputPath,
++        relativeExecutablePath,
++      ),
 +    };
 +    try {
 +      await runSetup(stagedBrowser, logger);
@@ -1307,12 +1312,26 @@ index 769987a4492..f0b7253ec3e 100644
 -  installedBrowser: InstalledBrowser,
 +  installedBrowser: Pick<
 +    InstalledBrowser,
-+    'browser' | 'platform' | 'executablePath'
++    'browser' | 'platform' | 'executablePath' | 'path'
 +  >,
    logger?: Logger,
  ): Promise<void> {
    // On Windows for Chrome invoke setup.exe to configure sandboxes.
-@@ -565,6 +654,130 @@ async function runSetup(
+@@ -550,8 +644,12 @@ async function runSetup(
+       if (!existsSync(setupExePath)) {
+         return;
+       }
++      const validatedSetupPath = validateExecutablePath(
++        installedBrowser.path,
++        path.relative(installedBrowser.path, setupExePath),
++      );
+       spawnSync(
+-        path.join(browserDir, 'setup.exe'),
++        validatedSetupPath,
+         [`--configure-browser-in-directory=` + browserDir],
+         {
+           shell: false,
+@@ -565,6 +663,132 @@ async function runSetup(
    }
  }
  
@@ -1323,6 +1342,8 @@ index 769987a4492..f0b7253ec3e 100644
 +  buildId: string,
 +): {browser: InstalledBrowser; kind: 'new' | 'legacy'} | undefined {
 +  const outputPath = cache.installationDir(browser, platform, buildId);
++  // Preserve directory links in an existing, trusted cache. Publication
++  // separately requires a regular directory before adopting a winner.
 +  if (!existsSync(outputPath)) {
 +    return;
 +  }
@@ -1445,10 +1466,10 @@ index 769987a4492..f0b7253ec3e 100644
   */
 diff --git a/packages/browsers/src/installMarker.ts b/packages/browsers/src/installMarker.ts
 new file mode 100644
-index 00000000000..c19ef628179
+index 00000000000..5ca2633607b
 --- /dev/null
 +++ b/packages/browsers/src/installMarker.ts
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,186 @@
 +/**
 + * @license
 + * Copyright 2026 Google Inc.
@@ -1531,7 +1552,6 @@ index 00000000000..c19ef628179
 +  const executablePath = validateExecutablePath(
 +    installationDir,
 +    relativeExecutablePath,
-+    markerPath,
 +  );
 +  return {
 +    version: 1,
@@ -1551,7 +1571,7 @@ index 00000000000..c19ef628179
 +  relativeExecutablePath: string,
 +): void {
 +  const markerPath = path.join(installationDir, INSTALL_MARKER_FILE);
-+  validateExecutablePath(installationDir, relativeExecutablePath, markerPath);
++  validateExecutablePath(installationDir, relativeExecutablePath);
 +  const marker: InstallMarker = {
 +    version: 1,
 +    relativeExecutablePath,
@@ -1559,11 +1579,16 @@ index 00000000000..c19ef628179
 +  fs.writeFileSync(markerPath, JSON.stringify(marker), {flag: 'wx'});
 +}
 +
-+function validateExecutablePath(
++/**
++ * Validates an executable without writing a completion marker.
++ *
++ * @internal
++ */
++export function validateExecutablePath(
 +  installationDir: string,
 +  relativeExecutablePath: string,
-+  markerPath: string,
 +): string {
++  const markerPath = path.join(installationDir, INSTALL_MARKER_FILE);
 +  if (path.isAbsolute(relativeExecutablePath)) {
 +    throw invalidMarker(markerPath, 'the executable path is absolute');
 +  }
@@ -1633,10 +1658,10 @@ index 00000000000..c19ef628179
 +}
 diff --git a/packages/browsers/src/installStaging.ts b/packages/browsers/src/installStaging.ts
 new file mode 100644
-index 00000000000..1303f87805a
+index 00000000000..acf7cdd5f76
 --- /dev/null
 +++ b/packages/browsers/src/installStaging.ts
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,226 @@
 +/**
 + * @license
 + * Copyright 2026 Google Inc.
@@ -1817,6 +1842,8 @@ index 00000000000..1303f87805a
 +    }
 +    throw error;
 +  }
++  // Unlike an initial cache hit, a winner encountered during publication
++  // must be a regular directory, even when a link has a valid marker.
 +  if (!stat.isDirectory() || stat.isSymbolicLink()) {
 +    throw new InvalidInstallTreeError(
 +      `Installation path is not a regular directory: ${installationDir}`,
@@ -2815,10 +2842,10 @@ index 62596ca62d7..14dc41b39e9 100644
  });
 diff --git a/packages/browsers/test/src/install.test.ts b/packages/browsers/test/src/install.test.ts
 new file mode 100644
-index 00000000000..86d94ca5502
+index 00000000000..c7e167b1b9f
 --- /dev/null
 +++ b/packages/browsers/test/src/install.test.ts
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,908 @@
 +/**
 + * @license
 + * Copyright 2026 Google Inc.
@@ -2826,11 +2853,15 @@ index 00000000000..86d94ca5502
 + */
 +
 +import assert from 'node:assert';
++import childProcess from 'node:child_process';
 +import fs from 'node:fs';
 +import http from 'node:http';
++import {syncBuiltinESMExports} from 'node:module';
 +import type {AddressInfo} from 'node:net';
 +import os from 'node:os';
 +import path from 'node:path';
++
++import sinon from 'sinon';
 +
 +import {executablePathByBrowser} from '../../lib/browser-data/browser-data.js';
 +import {internalConstantsForTesting as fileUtilConstants} from '../../lib/fileUtil.js';
@@ -3064,6 +3095,121 @@ index 00000000000..86d94ca5502
 +    assert.strictEqual(
 +      fs.existsSync(path.join(installationDir, INSTALL_MARKER_FILE)),
 +      false,
++    );
++  });
++
++  for (const withMarker of [false, true]) {
++    it(`accepts an existing ${withMarker ? 'completed' : 'legacy'} installation junction`, async () => {
++      const cache = new Cache(tmpDir);
++      const installationDir = cache.installationDir(
++        Browser.CHROME,
++        BrowserPlatform.LINUX,
++        '123',
++      );
++      const target = path.join(tmpDir, 'external');
++      const relativeExecutablePath = path.join('browser', 'chrome');
++      const executablePath = path.join(target, relativeExecutablePath);
++      fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++      fs.writeFileSync(executablePath, 'existing');
++      if (withMarker) {
++        writeInstallMarker(target, relativeExecutablePath);
++      } else {
++        cache.writeExecutablePath(
++          Browser.CHROME,
++          BrowserPlatform.LINUX,
++          '123',
++          relativeExecutablePath,
++        );
++      }
++      fs.mkdirSync(cache.browserRoot(Browser.CHROME), {recursive: true});
++      fs.symlinkSync(target, installationDir, 'junction');
++      const markerPath = path.join(target, INSTALL_MARKER_FILE);
++      const marker = withMarker ? fs.readFileSync(markerPath) : undefined;
++      const provider = new TestProvider(serverUrl);
++
++      const browser = await install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [provider],
++        baseUrl: serverUrl.origin,
++      });
++
++      assert.strictEqual(
++        browser.executablePath,
++        path.join(installationDir, relativeExecutablePath),
++      );
++      assert.strictEqual(fs.lstatSync(installationDir).isSymbolicLink(), true);
++      assert.strictEqual(
++        fs.realpathSync(browser.path),
++        fs.realpathSync(target),
++      );
++      assert.strictEqual(fs.readFileSync(executablePath, 'utf8'), 'existing');
++      if (withMarker) {
++        assert.deepStrictEqual(fs.readFileSync(markerPath), marker);
++      } else {
++        assert.strictEqual(fs.existsSync(markerPath), false);
++      }
++      assert.strictEqual(provider.executablePathCalls, 0);
++      assert.strictEqual(
++        fs.existsSync(path.join(cache.browserRoot(Browser.CHROME), '.staging')),
++        false,
++      );
++    });
++  }
++
++  it('rejects an installation junction appearing during install without provider fallback', async () => {
++    const cache = new Cache(tmpDir);
++    const installationDir = cache.installationDir(
++      Browser.CHROME,
++      BrowserPlatform.LINUX,
++      '123',
++    );
++    const target = path.join(tmpDir, 'external');
++    const relativeExecutablePath = path.join('browser', 'chrome');
++    const executablePath = path.join(target, relativeExecutablePath);
++    fs.mkdirSync(path.dirname(executablePath), {recursive: true});
++    fs.writeFileSync(executablePath, 'existing');
++    writeInstallMarker(target, relativeExecutablePath);
++    const markerPath = path.join(target, INSTALL_MARKER_FILE);
++    const marker = fs.readFileSync(markerPath);
++    const firstProvider = new TestProvider(serverUrl, () => {
++      // The initial cache lookup has already observed no installation.
++      fs.symlinkSync(target, installationDir, 'junction');
++    });
++    const fallbackProvider = new TestProvider(serverUrl);
++
++    await assert.rejects(
++      install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.LINUX,
++        buildId: '123',
++        providers: [firstProvider, fallbackProvider],
++        baseUrl: serverUrl.origin,
++      }),
++      (error: unknown) => {
++        assert.ok(error instanceof IncompleteInstallationError);
++        assert.match(
++          error.message,
++          /Installation path is not a regular directory/,
++        );
++        return true;
++      },
++    );
++
++    assert.strictEqual(fallbackProvider.supportsCalls, 0);
++    assert.strictEqual(fs.lstatSync(installationDir).isSymbolicLink(), true);
++    assert.strictEqual(
++      fs.realpathSync(installationDir),
++      fs.realpathSync(target),
++    );
++    assert.strictEqual(fs.readFileSync(executablePath, 'utf8'), 'existing');
++    assert.deepStrictEqual(fs.readFileSync(markerPath), marker);
++    assert.deepStrictEqual(
++      fs.readdirSync(path.join(cache.browserRoot(Browser.CHROME), '.staging')),
++      [],
 +    );
 +  });
 +
@@ -3385,6 +3531,197 @@ index 00000000000..86d94ca5502
 +    );
 +  });
 +
++  describe('Windows setup', () => {
++    let setup: sinon.SinonStub;
++    let prepareOutput: (outputPath: string) => void;
++
++    beforeEach(() => {
++      sinon.stub(os, 'platform').returns('win32');
++      sinon.stub(os, 'arch').returns('x64');
++      setup = sinon.stub(childProcess, 'spawnSync').returns({
++        pid: 0,
++        output: [],
++        stdout: Buffer.alloc(0),
++        stderr: Buffer.alloc(0),
++        status: 0,
++        signal: null,
++      });
++      syncBuiltinESMExports();
++      prepareOutput = outputPath => {
++        fs.mkdirSync(path.join(outputPath, 'browser'), {recursive: true});
++        fs.writeFileSync(path.join(outputPath, 'browser', 'chrome'), 'browser');
++        fs.writeFileSync(
++          path.join(outputPath, 'browser', 'setup.exe'),
++          'setup',
++        );
++      };
++      sinon.stub(fileUtilConstants, 'dmgReaddir').resolves(['Browser.app']);
++      sinon
++        .stub(fileUtilConstants, 'dmgExecFile')
++        .callsFake(async (file, args) => {
++          if (file === 'cp') {
++            prepareOutput(args[2]!);
++          } else if (args[0] === 'attach') {
++            return {stdout: '/dev/disk1\t/Volumes/Browser\n', stderr: ''};
++          } else if (args[0] !== 'detach') {
++            throw new Error(`Unexpected command: ${file} ${args.join(' ')}`);
++          }
++          return {stdout: '', stderr: ''};
++        });
++    });
++
++    afterEach(() => {
++      sinon.restore();
++      syncBuiltinESMExports();
++    });
++
++    function installForWindows(
++      relativeExecutablePath = path.join('browser', 'chrome'),
++    ) {
++      const provider = new TestProvider(new URL('/test.dmg', serverUrl));
++      provider.getExecutablePath = () => {
++        return relativeExecutablePath;
++      };
++      return install({
++        cacheDir: tmpDir,
++        browser: Browser.CHROME,
++        platform: BrowserPlatform.WIN64,
++        buildId: '123',
++        providers: [provider],
++        baseUrl: serverUrl.origin,
++      });
++    }
++
++    it('rejects an escaping executable path before invoking setup', async () => {
++      const outside = path.join(tmpDir, 'outside');
++      prepareOutput(outside);
++      await assert.rejects(
++        installForWindows(
++          path.join('..', '..', '..', '..', 'outside', 'browser', 'chrome'),
++        ),
++        /escapes the installation root/,
++      );
++      assert.strictEqual(setup.called, false);
++    });
++
++    it('rejects an executable outside the tree through a junction before setup', async () => {
++      const outside = path.join(tmpDir, 'outside');
++      prepareOutput(outside);
++      prepareOutput = outputPath => {
++        fs.symlinkSync(
++          path.join(outside, 'browser'),
++          path.join(outputPath, 'browser'),
++          'junction',
++        );
++      };
++      await assert.rejects(installForWindows(), /resolves outside/);
++      assert.strictEqual(setup.called, false);
++    });
++
++    it('rejects a setup helper resolving outside the tree', async () => {
++      const prepare = prepareOutput;
++      prepareOutput = outputPath => {
++        prepare(outputPath);
++        sinon
++          .stub(fs, 'realpathSync')
++          .callThrough()
++          .withArgs(path.join(outputPath, 'browser', 'setup.exe'))
++          .returns(path.join(tmpDir, 'outside', 'setup.exe'));
++      };
++      await assert.rejects(installForWindows(), /resolves outside/);
++      assert.strictEqual(setup.called, false);
++    });
++
++    it('rejects a setup helper that is not a regular file', async () => {
++      prepareOutput = outputPath => {
++        fs.mkdirSync(path.join(outputPath, 'browser', 'setup.exe'), {
++          recursive: true,
++        });
++        fs.writeFileSync(path.join(outputPath, 'browser', 'chrome'), 'browser');
++      };
++      await assert.rejects(installForWindows(), /not a regular file/);
++      assert.strictEqual(setup.called, false);
++    });
++
++    it('runs setup before writing the completion marker and publishing', async () => {
++      let stagedPath: string | undefined;
++      setup.callsFake((file: string, args: string[]) => {
++        stagedPath = path.dirname(path.dirname(file));
++        assert.deepStrictEqual(args, [
++          `--configure-browser-in-directory=${path.dirname(file)}`,
++        ]);
++        assert.strictEqual(
++          fs.existsSync(path.join(stagedPath, INSTALL_MARKER_FILE)),
++          false,
++        );
++        assert.strictEqual(
++          fs.existsSync(path.join(tmpDir, 'chrome', 'win64-123')),
++          false,
++        );
++        return {status: 0};
++      });
++      const browser = await installForWindows();
++      assert.strictEqual(setup.calledOnce, true);
++      assert.ok(stagedPath);
++      assert.strictEqual(fs.existsSync(stagedPath), false);
++      assert.strictEqual(
++        fs.existsSync(path.join(browser.path, INSTALL_MARKER_FILE)),
++        true,
++      );
++    });
++
++    it('revalidates the executable after setup before writing the marker', async () => {
++      setup.callsFake((file: string) => {
++        fs.unlinkSync(path.join(path.dirname(file), 'chrome'));
++        return {status: 0};
++      });
++      await assert.rejects(installForWindows(), /ENOENT/);
++      assert.strictEqual(setup.calledOnce, true);
++      assert.strictEqual(
++        fs.existsSync(path.join(tmpDir, 'chrome', 'win64-123')),
++        false,
++      );
++    });
++
++    it('allows an installation without a setup helper', async () => {
++      const prepare = prepareOutput;
++      prepareOutput = outputPath => {
++        prepare(outputPath);
++        fs.unlinkSync(path.join(outputPath, 'browser', 'setup.exe'));
++      };
++      const browser = await installForWindows();
++      assert.strictEqual(setup.called, false);
++      assert.strictEqual(fs.existsSync(browser.executablePath), true);
++    });
++
++    it('validates the setup helper on a legacy cache hit', async () => {
++      const cache = new Cache(tmpDir);
++      const finalPath = cache.installationDir(
++        Browser.CHROME,
++        BrowserPlatform.WIN64,
++        '123',
++      );
++      prepareOutput(finalPath);
++      cache.writeExecutablePath(
++        Browser.CHROME,
++        BrowserPlatform.WIN64,
++        '123',
++        path.join('browser', 'chrome'),
++      );
++      sinon
++        .stub(fs, 'realpathSync')
++        .callThrough()
++        .withArgs(path.join(finalPath, 'browser', 'setup.exe'))
++        .returns(path.join(tmpDir, 'outside', 'setup.exe'));
++      await assert.rejects(installForWindows(), /resolves outside/);
++      assert.strictEqual(setup.called, false);
++      assert.strictEqual(
++        fs.existsSync(path.join(finalPath, 'browser', 'chrome')),
++        true,
++      );
++    });
++  });
++
 +  class TestProvider implements BrowserProvider {
 +    executablePathCalls = 0;
 +    supportsCalls = 0;
@@ -3630,10 +3967,10 @@ index 00000000000..6404a18b003
 +});
 diff --git a/packages/browsers/test/src/installStaging.test.ts b/packages/browsers/test/src/installStaging.test.ts
 new file mode 100644
-index 00000000000..275d0d8eba3
+index 00000000000..b07094111e1
 --- /dev/null
 +++ b/packages/browsers/test/src/installStaging.test.ts
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,309 @@
 +/**
 + * @license
 + * Copyright 2026 Google Inc.
@@ -3655,6 +3992,7 @@ index 00000000000..275d0d8eba3
 +  createInstallAttempt,
 +  InstallArchivePublicationError,
 +  internalConstantsForTesting,
++  InvalidInstallTreeError,
 +  publishInstallArchive,
 +  publishInstallTree,
 +  removeInstallAttempt,
@@ -3768,6 +4106,41 @@ index 00000000000..275d0d8eba3
 +    }
 +  });
 +
++  it('rejects an installation junction discovered after rename fails', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    const executablePath = prepareOutput(attempt.outputPath, 'candidate');
++    const installationDir = path.join(browserRoot, 'linux-123');
++    const target = path.join(tmpDir, 'external');
++    prepareOutput(target, 'existing');
++    const rename = sinon.stub(fsPromises, 'rename').callsFake(async () => {
++      fs.symlinkSync(target, installationDir, 'junction');
++      throw new Error('rename failed');
++    });
++    syncBuiltinESMExports();
++
++    try {
++      await assert.rejects(
++        publishInstallTree(attempt.outputPath, installationDir),
++        InvalidInstallTreeError,
++      );
++      assert.ok(
++        rename.calledOnceWithExactly(attempt.outputPath, installationDir),
++      );
++      assert.strictEqual(fs.lstatSync(installationDir).isSymbolicLink(), true);
++      assert.strictEqual(
++        fs.readFileSync(path.join(target, executablePath), 'utf8'),
++        'existing',
++      );
++      assert.strictEqual(
++        fs.readFileSync(path.join(attempt.outputPath, executablePath), 'utf8'),
++        'candidate',
++      );
++    } finally {
++      rename.restore();
++      syncBuiltinESMExports();
++    }
++  });
++
 +  it('rejects a marker-less directory that appears during publication', async () => {
 +    const attempt = await createInstallAttempt(browserRoot);
 +    prepareOutput(attempt.outputPath, 'candidate');
@@ -3826,6 +4199,22 @@ index 00000000000..275d0d8eba3
 +    } finally {
 +      internalConstantsForTesting.rm = originalRm;
 +    }
++  });
++
++  it('removes an attempt containing a junction without removing its target', async () => {
++    const attempt = await createInstallAttempt(browserRoot);
++    prepareOutput(attempt.outputPath, 'candidate');
++    const target = path.join(tmpDir, 'external');
++    const executablePath = prepareOutput(target, 'existing');
++    fs.symlinkSync(target, path.join(attempt.outputPath, 'linked'), 'junction');
++
++    await removeInstallAttempt(attempt.path);
++
++    assert.strictEqual(fs.existsSync(attempt.path), false);
++    assert.strictEqual(
++      fs.readFileSync(path.join(target, executablePath), 'utf8'),
++      'existing',
++    );
 +  });
 +
 +  it('does not replace an archive that appears during publication', async () => {

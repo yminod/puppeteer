@@ -99,6 +99,19 @@ if (mode === 'transport') {
         'rejects getText when a relatively redirected request fails',
         'resolves HEAD as false when a relatively redirected request fails',
         'should remove the alias of an uninstalled browser',
+        'rejects an escaping executable path before invoking setup',
+        'rejects an executable outside the tree through a junction before setup',
+        'rejects a setup helper resolving outside the tree',
+        'rejects a setup helper that is not a regular file',
+        'runs setup before writing the completion marker and publishing',
+        'revalidates the executable after setup before writing the marker',
+        'allows an installation without a setup helper',
+        'validates the setup helper on a legacy cache hit',
+        'accepts an existing legacy installation junction',
+        'accepts an existing completed installation junction',
+        'rejects an installation junction appearing during install without provider fallback',
+        'rejects an installation junction discovered after rename fails',
+        'removes an attempt containing a junction without removing its target',
       ]) {
         assert.ok(log.includes(`✔ ${name}`), name);
       }

@@ -1,8 +1,7 @@
 {
   "sourceBase": "bd227cea68835f8e6bbc983b9ca4564cebfa8938",
-  "sourceTree": "99fa1aa8ab5b8ddb76ebc3440598854c49245feb",
-  "macStagingHead": "dba0e5cf5f3ea78076402bc59543b05af072bc60",
-  "patchSha256": "71d6e9a86567e4b5996fd940535e377aac2f2b7b7d97004c3b9cd52d7bddc8ec",
+  "sourceTree": "457a7f39230e8e360c94b938967fe818fc97de30",
+  "patchSha256": "57135c2d7a5b4e2fafd44600d5604b0ff0331eee796a5c864f9169637c70483a",
   "transportPaths": [
     ".github/experiments/staging-upstream-linux-2026-10-21/.gitattributes",
     ".github/experiments/staging-upstream-linux-2026-10-21/candidate.patch",
@@ -28,18 +27,18 @@
     },
     {
       "path": "packages/browsers/src/install.ts",
-      "size": 26333,
-      "sha256": "95687f6476f8306f020fa4c78291729184670a2bb7651a279229e64db087d054"
+      "size": 26723,
+      "sha256": "0c2fed5369510814e92e807127d85cd4c41474fb5ef9782e9f1b6ef7f216d08c"
     },
     {
       "path": "packages/browsers/src/installMarker.ts",
-      "size": 4752,
-      "sha256": "ab51cee785cd35e1b4be9466efdc8e8f55c8178360abf8965db16bbaa594ceae"
+      "size": 4867,
+      "sha256": "dd2dc7609724b544d39edb71fb9bc4e7d5676e861ad8bd15cb883db1c7b8b34d"
     },
     {
       "path": "packages/browsers/src/installStaging.ts",
-      "size": 5617,
-      "sha256": "300a92574a9a5e0cebe74e961c4d24cf7ab189252a07b5df0294d4381da642b8"
+      "size": 5762,
+      "sha256": "693dac471922a5f0a96a6757af1bf073b09222d8b60c49a8303840168add920b"
     },
     {
       "path": "packages/browsers/src/provider.ts",
@@ -63,8 +62,8 @@
     },
     {
       "path": "packages/browsers/test/src/install.test.ts",
-      "size": 18492,
-      "sha256": "53c76f278d0822131498efc24ecbc63b129dafb8ffcf0a63afb96c96ee965e6d"
+      "size": 29406,
+      "sha256": "af569e17f3543e5ed76b52a600215a31865c0bb7c7c46371d1eda1afb2fcd5cf"
     },
     {
       "path": "packages/browsers/test/src/installMarker.test.ts",
@@ -73,8 +72,8 @@
     },
     {
       "path": "packages/browsers/test/src/installStaging.test.ts",
-      "size": 8771,
-      "sha256": "e3dc51616a76aa13f410f81a8d580716c3123e898153d5f9ae85f13a6939df57"
+      "size": 10682,
+      "sha256": "c7a15a2ac4302436b89ce8db1f39c3b00277c8017fd8cf85e02e63f1f4e94426"
     },
     {
       "path": "packages/browsers/test/src/installWithProviders.test.ts",
@@ -105,18 +104,18 @@
     },
     {
       "path": "packages/browsers/lib/install.js",
-      "size": 21205,
-      "sha256": "68e239dd3d4b7e692ae6bf41df9f6e24bfe7332fbc50cabb958433bd91d814b5"
+      "size": 21550,
+      "sha256": "19b405927bff31b334730fd0d5c9cac7883d70242417d50e5b4a1e2526f1f5d7"
     },
     {
       "path": "packages/browsers/lib/installMarker.js",
-      "size": 4381,
-      "sha256": "5942cf113df29f0a8c66233b7a1ee28d4b7a6f4bb85b07c26f67299eca483e4d"
+      "size": 4512,
+      "sha256": "fd920d1ce0afb4958fc8bff393dcf41a1f62b1a82fdde8f87ee13eadec8c8277"
     },
     {
       "path": "packages/browsers/lib/installStaging.js",
-      "size": 5296,
-      "sha256": "58431ecc007dd9747f2167010b250bdf7604bf623441f3a53f77d42aefa1747e"
+      "size": 5445,
+      "sha256": "0b5803a928e16206bac8806ea324751d5f2b632a51734507013aa371257f7fce"
     },
     {
       "path": "packages/browsers/lib/provider.js",
@@ -125,8 +124,10 @@
     }
   ],
   "linuxPackage": {
-    "passing": 211,
+    "passing": 224,
     "pending": 1
   },
-  "chromeBuild": "155.0.8059.84"
+  "chromeBuild": "155.0.8059.84",
+  "windowsCandidateHead": "9c5b7c9f7db014667d7e580046dc5cad3ef31c73",
+  "windowsDirtyPatchSha256": "95d2502af12fafbb0c5afbd995eadf69b652a441c3f5722cfac2725d95b83d71"
 }
