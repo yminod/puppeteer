@@ -1,0 +1,451 @@
+diff --git a/packages/browsers/src/httpUtil.ts b/packages/browsers/src/httpUtil.ts
+index 661fe6a8457..25d69072374 100644
+--- a/packages/browsers/src/httpUtil.ts
++++ b/packages/browsers/src/httpUtil.ts
+@@ -8,11 +8,13 @@ import {createHash} from 'node:crypto';
+ import {createWriteStream, unlinkSync} from 'node:fs';
+ import * as http from 'node:http';
+ import * as https from 'node:https';
++import {Transform} from 'node:stream';
++import {finished, pipeline} from 'node:stream/promises';
+ import {URL, urlToHttpOptions} from 'node:url';
+ 
+ export async function headHttpRequest(url: URL): Promise<boolean> {
+   return await new Promise(resolve => {
+-    httpRequest(
++    void httpRequest(
+       url,
+       'HEAD',
+       response => {
+@@ -21,15 +23,12 @@ export async function headHttpRequest(url: URL): Promise<boolean> {
+         resolve(response.statusCode === 200);
+       },
+       false,
+-    )
+-      .then(request => {
+-        request.on('error', () => {
+-          resolve(false);
+-        });
+-      })
+-      .catch(() => {
++      () => {
+         resolve(false);
+-      });
++      },
++    ).catch(() => {
++      resolve(false);
++    });
+   });
+ }
+ 
+@@ -38,6 +37,7 @@ export async function httpRequest(
+   method: string,
+   response: (x: http.IncomingMessage) => void,
+   keepAlive = true,
++  onError?: (error: Error) => void,
+ ): Promise<http.ClientRequest> {
+   let agent: http.Agent | undefined;
+   try {
+@@ -65,7 +65,15 @@ export async function httpRequest(
+       res.statusCode < 400 &&
+       res.headers.location
+     ) {
+-      void httpRequest(new URL(res.headers.location, url), method, response);
++      void httpRequest(
++        new URL(res.headers.location, url),
++        method,
++        response,
++        keepAlive,
++        onError,
++      ).catch(error => {
++        onError?.(error);
++      });
+       // consume response data to free up memory
+       // And prevents the connection from being kept alive
+       res.resume();
+@@ -77,6 +85,9 @@ export async function httpRequest(
+     options.protocol === 'https:'
+       ? https.request(options, requestCallback)
+       : http.request(options, requestCallback);
++  if (onError) {
++    request.once('error', onError);
++  }
+   request.end();
+   return request;
+ }
+@@ -107,103 +118,91 @@ class HashVerifier {
+ /**
+  * @internal
+  */
+-export function downloadFile(
++export async function downloadFile(
+   url: URL,
+   destinationPath: string,
+   progressCallback?: (downloadedBytes: number, totalBytes: number) => void,
+   expectedHash?: string,
+ ): Promise<void> {
+-  return new Promise<void>(async (resolve, reject) => {
+-    let downloadedBytes = 0;
+-    let totalBytes: number | undefined;
+-    const verifier = expectedHash ? new HashVerifier() : null;
++  const response = await new Promise<http.IncomingMessage>(
++    (resolve, reject) => {
++      void httpRequest(url, 'GET', resolve, true, reject).catch(reject);
++    },
++  );
+ 
+-    const cleanup = (): void => {
+-      try {
+-        unlinkSync(destinationPath);
+-      } catch {}
+-    };
++  if (response.statusCode !== 200) {
++    const responseClosed = finished(response).catch(() => {});
++    response.destroy();
++    await responseClosed;
++    throw new Error(
++      `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
++    );
++  }
+ 
+-    const downloadError = (cause?: Error): Error => {
+-      const options = cause ? {cause} : undefined;
+-      if (totalBytes === undefined) {
+-        return new Error(
+-          `Download failed: connection closed before the download completed. URL: ${url}`,
+-          options,
+-        );
+-      }
++  let downloadedBytes = 0;
++  const contentLength = Number.parseInt(
++    response.headers['content-length'] ?? '',
++    10,
++  );
++  const totalBytes = Number.isFinite(contentLength) ? contentLength : undefined;
++  const downloadError = (cause: unknown): Error => {
++    if (totalBytes === undefined) {
+       return new Error(
+-        `Download failed: expected ${totalBytes} bytes, received ${downloadedBytes} bytes. URL: ${url}`,
+-        options,
++        `Download failed: connection closed before the download completed. URL: ${url}`,
++        {cause},
+       );
+-    };
++    }
++    return new Error(
++      `Download failed: expected ${totalBytes} bytes, received ${downloadedBytes} bytes. URL: ${url}`,
++      {cause},
++    );
++  };
++  // Local failures can abort the response too; preserve their primary error.
++  let firstError: unknown;
++  let responseError: Error | undefined;
++  const verifier = expectedHash ? new HashVerifier() : null;
++  const progress = new Transform({
++    transform(chunk: Buffer, _encoding, callback) {
++      try {
++        downloadedBytes += chunk.length;
++        verifier?.update(chunk);
++        progressCallback?.(downloadedBytes, totalBytes ?? 0);
++      } catch (error) {
++        const failure =
++          error instanceof Error ? error : new Error(String(error));
++        firstError ??= failure;
++        callback(failure);
++        return;
++      }
++      callback(null, chunk);
++    },
++  });
+ 
+-    try {
+-      const request = await httpRequest(url, 'GET', response => {
+-        if (response.statusCode !== 200) {
+-          const error = new Error(
+-            `Download failed: server returned code ${response.statusCode}. URL: ${url}`,
+-          );
+-          // consume response data to free up memory
+-          response.resume();
+-          reject(error);
+-          return;
+-        }
+-        const file = createWriteStream(destinationPath);
+-        let error: Error | undefined;
+-        const failDownload = (downloadError: Error): void => {
+-          error ??= downloadError;
+-          response.destroy();
+-          file.destroy();
+-        };
+-        file.on('close', () => {
+-          if (error) {
+-            cleanup();
+-            reject(error);
+-            return;
+-          }
+-          if (verifier && expectedHash) {
+-            try {
+-              verifier.verify(url, destinationPath, expectedHash);
+-            } catch (err) {
+-              reject(err);
+-              return;
+-            }
+-          }
+-          return resolve();
+-        });
+-        file.on('error', failDownload);
+-        const contentLength = Number.parseInt(
+-          response.headers['content-length'] ?? '',
+-          10,
+-        );
+-        totalBytes = Number.isFinite(contentLength) ? contentLength : undefined;
+-        response.on('close', () => {
+-          if (!response.complete) {
+-            failDownload(downloadError());
+-          }
+-        });
+-        response.on('error', responseError => {
+-          failDownload(
+-            response.complete ? responseError : downloadError(responseError),
+-          );
+-        });
+-        response.on('data', (chunk: Buffer) => {
+-          downloadedBytes += chunk.length;
+-          verifier?.update(chunk);
+-          if (progressCallback) {
+-            progressCallback(downloadedBytes, totalBytes ?? 0);
+-          }
+-        });
+-        response.pipe(file);
+-      });
+-      request.on('error', error => {
+-        return reject(error);
+-      });
+-    } catch (error) {
+-      reject(error);
++  const destination = createWriteStream(destinationPath);
++  destination.once('error', error => {
++    firstError ??= error;
++  });
++  response.once('error', error => {
++    if (!firstError) {
++      responseError = error;
+     }
++    firstError ??= error;
+   });
++  try {
++    await pipeline(response, progress, destination);
++  } catch (error) {
++    // pipeline waits for teardown before removing the partial download.
++    try {
++      unlinkSync(destinationPath);
++    } catch {}
++    if (!response.complete && error === responseError) {
++      throw downloadError(error);
++    }
++    throw error;
++  }
++  if (verifier && expectedHash) {
++    verifier.verify(url, destinationPath, expectedHash);
++  }
+ }
+ 
+ export async function getJSON(url: URL): Promise<unknown> {
+@@ -216,36 +215,30 @@ export async function getJSON(url: URL): Promise<unknown> {
+ }
+ 
+ export function getText(url: URL): Promise<string> {
+-  return new Promise(async (resolve, reject) => {
+-    try {
+-      const request = await httpRequest(
+-        url,
+-        'GET',
+-        response => {
+-          let data = '';
+-          if (response.statusCode && response.statusCode >= 400) {
+-            return reject(new Error(`Got status code ${response.statusCode}`));
++  return new Promise((resolve, reject) => {
++    void httpRequest(
++      url,
++      'GET',
++      response => {
++        let data = '';
++        if (response.statusCode && response.statusCode >= 400) {
++          return reject(new Error(`Got status code ${response.statusCode}`));
++        }
++        response.on('data', chunk => {
++          data += chunk;
++        });
++        response.on('end', () => {
++          try {
++            return resolve(String(data));
++          } catch {
++            return reject(
++              new Error(`Failed to read text response from ${url}`),
++            );
+           }
+-          response.on('data', chunk => {
+-            data += chunk;
+-          });
+-          response.on('end', () => {
+-            try {
+-              return resolve(String(data));
+-            } catch {
+-              return reject(
+-                new Error(`Failed to read text response from ${url}`),
+-              );
+-            }
+-          });
+-        },
+-        false,
+-      );
+-      request.on('error', err => {
+-        reject(err);
+-      });
+-    } catch (err) {
+-      reject(err);
+-    }
++        });
++      },
++      false,
++      reject,
++    ).catch(reject);
+   });
+ }
+diff --git a/packages/browsers/test/src/httpUtil.test.ts b/packages/browsers/test/src/httpUtil.test.ts
+index 62596ca62d7..14dc41b39e9 100644
+--- a/packages/browsers/test/src/httpUtil.test.ts
++++ b/packages/browsers/test/src/httpUtil.test.ts
+@@ -6,6 +6,7 @@
+ 
+ import assert from 'node:assert';
+ import {createHash} from 'node:crypto';
++import {once} from 'node:events';
+ import fs from 'node:fs';
+ import http from 'node:http';
+ import os from 'node:os';
+@@ -17,13 +18,28 @@ describe('downloadFile', function () {
+   let tmpDir: string;
+   let server: http.Server;
+   let serverUrl: URL;
++  let streamingResponse: http.ServerResponse;
+ 
+   const testContent = Buffer.from('test browser binary content');
+   const correctHash = createHash('sha256').update(testContent).digest('hex');
+ 
+   beforeEach(async () => {
+     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-httputil-test'));
+-    server = http.createServer((_req, res) => {
++    server = http.createServer((req, res) => {
++      if (req.url === '/streaming') {
++        streamingResponse = res;
++        res.writeHead(200, {'Content-Length': String(testContent.length * 2)});
++        res.write(testContent.subarray(0, 4));
++        return;
++      }
++      if (req.url === '/aborted') {
++        res.writeHead(200, {'Content-Length': String(testContent.length * 2)});
++        res.write(testContent.subarray(0, 4));
++        setImmediate(() => {
++          res.destroy();
++        });
++        return;
++      }
+       res.writeHead(200, {'Content-Length': String(testContent.length)});
+       res.end(testContent);
+     });
+@@ -35,6 +51,7 @@ describe('downloadFile', function () {
+   });
+ 
+   afterEach(async () => {
++    server.closeAllConnections();
+     await new Promise<void>(resolve => {
+       server.close(() => {
+         return resolve();
+@@ -293,4 +310,87 @@ describe('downloadFile', function () {
+     );
+     assert.ok(fs.existsSync(destPath));
+   });
++
++  it('preserves a progress callback error and tears down the transfer', async () => {
++    const destPath = path.join(tmpDir, 'download.bin');
++    const progressError = new Error('progress callback failed');
++    let progressCalls = 0;
++
++    await assert.rejects(
++      downloadFile(
++        new URL('/streaming', serverUrl),
++        destPath,
++        () => {
++          ++progressCalls;
++          throw progressError;
++        },
++        correctHash,
++      ),
++      (error: unknown) => {
++        assert.strictEqual(error, progressError);
++        return true;
++      },
++    );
++
++    assert.strictEqual(progressCalls, 1);
++    assert.strictEqual(fs.existsSync(destPath), false);
++    if (!streamingResponse.destroyed) {
++      await once(streamingResponse, 'close', {
++        signal: AbortSignal.timeout(1000),
++      });
++    }
++    assert.strictEqual(streamingResponse.destroyed, true);
++  });
++
++  it('rejects an interrupted response after closing the destination', async () => {
++    const destPath = path.join(tmpDir, 'download.bin');
++    const interruptedUrl = new URL('/aborted', serverUrl);
++
++    await assert.rejects(() => {
++      return downloadFile(interruptedUrl, destPath);
++    });
++
++    assert.strictEqual(fs.existsSync(destPath), false);
++  });
++});
++
++describe('HTTP request errors', () => {
++  let server: http.Server;
++  let redirectUrl: URL;
++
++  beforeEach(async () => {
++    server = http.createServer((req, res) => {
++      if (req.url === '/redirect') {
++        res.writeHead(302, {
++          Location: '/reset',
++        });
++        res.end();
++        return;
++      }
++      // Fail the redirected request before sending any response headers.
++      req.socket.destroy();
++    });
++    await new Promise<void>(resolve => {
++      server.listen(0, '127.0.0.1', resolve);
++    });
++    const address = server.address() as {port: number};
++    redirectUrl = new URL(`http://127.0.0.1:${address.port}/redirect`);
++  });
++
++  afterEach(async () => {
++    server.closeAllConnections();
++    await new Promise<void>(resolve => {
++      server.close(() => {
++        resolve();
++      });
++    });
++  });
++
++  it('rejects getText when a relatively redirected request fails', async () => {
++    await assert.rejects(getText(redirectUrl), {code: 'ECONNRESET'});
++  });
++
++  it('resolves HEAD as false when a relatively redirected request fails', async () => {
++    assert.strictEqual(await headHttpRequest(redirectUrl), false);
++  });
+ });

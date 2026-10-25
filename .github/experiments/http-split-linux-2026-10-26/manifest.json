@@ -1,0 +1,73 @@
+{
+  "sourceBase": "346bace62a480837302c9c820db0858d6e377e1b",
+  "sourceTree": "ceca7fd262a244cb04071703629574a4633fa86d",
+  "extractedFrom": "79b877fa438c0b12fe9386a1975da7706e0100e6",
+  "patchSha256": "053b5ac0e9126c1735839742d5d32ad004da76dc08938c34487dcdc4bc84d23e",
+  "transportPaths": [
+    ".github/experiments/http-split-linux-2026-10-26/.gitattributes",
+    ".github/experiments/http-split-linux-2026-10-26/candidate.patch",
+    ".github/experiments/http-split-linux-2026-10-26/manifest.json",
+    ".github/experiments/http-split-linux-2026-10-26/verify.mjs",
+    ".github/workflows/browser-http-split-linux.yml"
+  ],
+  "files": [
+    {
+      "path": "packages/browsers/src/httpUtil.ts",
+      "size": 6499,
+      "sha256": "f19b42a7b29ec053d7032ef3823ce33250a8603480194346559325a8e454ed8f"
+    },
+    {
+      "path": "packages/browsers/test/src/httpUtil.test.ts",
+      "size": 11597,
+      "sha256": "5e3a8c0cedefdfe0662eeaf2369255cef19f9312354ddcbb86bfb1abdd1e4827"
+    },
+    {
+      "path": "package-lock.json",
+      "size": 1395552,
+      "sha256": "d9f213c8f8009e4d8200e95ec9f041b912126d8bb8e60d5ead614d0175d09dd8"
+    },
+    {
+      "path": ".nvmrc",
+      "size": 3,
+      "sha256": "c747f3646963f5be94a54bdbbbc15ee7e635abdaa97cd1d398a598a8281131d3"
+    },
+    {
+      "path": ".npmrc",
+      "size": 378,
+      "sha256": "d6d58dead5ff12a7a96cd44db6aafb2eada1f7099a0719121cfa7fc5a47944d9"
+    },
+    {
+      "path": "tsconfig.base.json",
+      "size": 1036,
+      "sha256": "139618e0dc65781d0f2cc8b028d00d83f85061f2f9c49307c3919bc6c38b9a40"
+    },
+    {
+      "path": "packages/browsers/tsconfig.json",
+      "size": 164,
+      "sha256": "7ff83bebf7d51ddc9ee5356c09e8b3b511942e37c4ac9ba1e3da26c3c79c613d"
+    },
+    {
+      "path": "packages/browsers/test/src/tsconfig.json",
+      "size": 276,
+      "sha256": "04b452b45a03e409027239e17b47d7034302a2d930796f8fb35f78bcf462ca2f"
+    }
+  ],
+  "compiled": [
+    {
+      "path": "packages/browsers/lib/httpUtil.js",
+      "size": 6450,
+      "sha256": "13d9f1bf234848df343a80afa845ca3a0b0d4bf826204d9960003697a4d74267"
+    },
+    {
+      "path": "packages/browsers/test/build/httpUtil.test.js",
+      "size": 12601,
+      "sha256": "d34c0e25638b80f9b77a649b0dda11e5f2e82c485177eeecccb9917547586272"
+    }
+  ],
+  "httpTests": 19,
+  "unitTests": {
+    "ngSchematics": 30,
+    "puppeteer": 3,
+    "puppeteerCore": 247
+  }
+}
